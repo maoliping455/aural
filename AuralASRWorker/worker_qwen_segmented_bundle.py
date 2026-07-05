@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+
+import inspect
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+
+from alignment_postprocess import refine_segments_with_alignment, release_mlx_memory
+from itn_postprocess import apply_itn_to_transcript
+
+
+RESOURCES_ROOT = Path(__file__).resolve().parents[1]
+MODEL_ROOT = RESOURCES_ROOT / "asr-models" / "qwen3-asr-1.7b-4bit"
+AFCONVERT = Path("/usr/bin/afconvert")
+
+
+def emit(event):
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def fail(request, output_dir, code, message):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    error_log_path = output_dir / "error.log"
+    error_log_path.write_text(
+        f"{datetime.now(timezone.utc).isoformat()} {message}\n",
+        encoding="utf-8",
+    )
+    emit(
+        {
+            "type": "failed",
+            "request_id": request.get("request_id"),
+            "task_id": request.get("task_id"),
+            "error_code": code,
+            "error_log_path": str(error_log_path),
+        }
+    )
+
+
+def normalize_language(language):
+    if language == "auto":
+        return None
+    if language and language.startswith("zh"):
+        return "zh"
+    if language and language.startswith("en"):
+        return "en"
+    if language and language.startswith("ja"):
+        return "ja"
+    return language or None
+
+
+def output_text(result):
+    segments = getattr(result, "segments", None)
+    if isinstance(result, str):
+        return result
+    text = getattr(result, "text", None)
+    if isinstance(text, str):
+        if segments and text.lstrip().startswith(("[", "{", "```json")):
+            segment_text = " ".join(
+                str(item.get("text", "")).strip()
+                for item in segments
+                if isinstance(item, dict) and item.get("text")
+            ).strip()
+            if segment_text:
+                return segment_text
+        return text
+    if isinstance(result, dict):
+        result_segments = result.get("segments")
+        if result_segments:
+            segment_text = " ".join(
+                str(item.get("text", "")).strip()
+                for item in result_segments
+                if isinstance(item, dict) and item.get("text")
+            ).strip()
+            if segment_text:
+                return segment_text
+        value = result.get("text") or result.get("transcription") or result.get("result")
+        if isinstance(value, str):
+            return value
+    return str(result)
+
+
+def clean_asr_template_artifacts(text):
+    clean = str(text or "").strip()
+    clean = re.sub(
+        r"(?is)^\s*(?:language\s*)?(?:Chinese|English|Japanese|Cantonese|Mandarin|zh|en|ja|yue)?\s*<asr_text>\s*",
+        "",
+        clean,
+    )
+    clean = re.sub(r"(?is)</asr_text>\s*", "", clean)
+    clean = re.sub(r"(?s)<\|[^|>]+?\|>\s*", "", clean)
+    return clean.strip()
+
+
+def repeat_key(text):
+    return re.sub(r"[\s,.;:!?，。；：！？、\"'（）()]+", "", str(text or "")).lower()
+
+
+def sentence_units(text):
+    units = re.findall(r"[^。！？!?；;\n]+[。！？!?；;]?", str(text or ""))
+    return [unit.strip() for unit in units if unit.strip()]
+
+
+def collapse_repeated_sentences(text, min_run=4, keep=1):
+    units = sentence_units(text)
+    if len(units) < min_run:
+        return text, {"changed": False, "removed_repetitions": 0}
+
+    result = []
+    removed = 0
+    index = 0
+    while index < len(units):
+        key = repeat_key(units[index])
+        end = index + 1
+        while end < len(units) and key and repeat_key(units[end]) == key:
+            end += 1
+
+        count = end - index
+        if key and count >= min_run:
+            result.extend(units[index : index + keep])
+            removed += count - keep
+        else:
+            result.extend(units[index:end])
+        index = end
+
+    if removed <= 0:
+        return text, {"changed": False, "removed_repetitions": 0}
+    return "".join(result), {"changed": True, "removed_repetitions": removed}
+
+
+def generate_one(model, audio_path, language, system_prompt=None):
+    signature = inspect.signature(model.generate)
+    kwargs = {"max_tokens": 8192, "verbose": False}
+    if "language" in signature.parameters:
+        kwargs["language"] = language
+    if "source_lang" in signature.parameters:
+        kwargs["source_lang"] = language or "en"
+    if "target_lang" in signature.parameters:
+        kwargs["target_lang"] = language or "en"
+    if system_prompt and "system_prompt" in signature.parameters:
+        kwargs["system_prompt"] = system_prompt
+    if "audio" in signature.parameters:
+        return model.generate(audio=str(audio_path), **kwargs)
+    return model.generate(str(audio_path), **kwargs)
+
+
+def split_text_into_paragraphs(text, target_chars=70, max_chars=130):
+    clean = re.sub(r"\s+", " ", text).strip()
+    if not clean:
+        return []
+
+    strong_pattern = re.compile(r"[^。！？!?；;]+[。！？!?；;]?")
+    weak_pattern = re.compile(r"[^，,、]+[，,、]?")
+    strong_units = [item.group(0).strip() for item in strong_pattern.finditer(clean) if item.group(0).strip()]
+    if not strong_units:
+        strong_units = [clean]
+
+    units = []
+    for unit in strong_units:
+        if len(unit) <= target_chars:
+            units.append(unit)
+        else:
+            weak_units = [item.group(0).strip() for item in weak_pattern.finditer(unit) if item.group(0).strip()]
+            units.extend(weak_units or [unit])
+
+    paragraphs = []
+    current = ""
+    for unit in units:
+        if not current:
+            current = unit
+        elif len(current) + len(unit) <= target_chars:
+            current += unit
+        else:
+            paragraphs.append(current)
+            current = unit
+    if current:
+        paragraphs.append(current)
+
+    result = []
+    for paragraph in paragraphs:
+        result.extend(split_long_paragraph(paragraph, max_chars))
+    return [item for item in result if item]
+
+
+def split_long_paragraph(paragraph, max_chars):
+    paragraph = paragraph.strip()
+    if not paragraph:
+        return []
+    if len(paragraph) <= max_chars:
+        return [paragraph]
+
+    result = []
+    start = 0
+    min_split = max(20, int(max_chars * 0.55))
+    while start < len(paragraph):
+        end = min(start + max_chars, len(paragraph))
+        if end >= len(paragraph):
+            item = paragraph[start:].strip()
+            if item:
+                result.append(item)
+            break
+
+        window = paragraph[start:end]
+        split_at = -1
+        for match in re.finditer(r"\s+", window):
+            if match.start() >= min_split:
+                split_at = match.start()
+
+        if split_at < 0:
+            for offset in range(len(window) - 1, min_split, -1):
+                if window[offset] in ",.;:!?，。；：！？、":
+                    split_at = offset + 1
+                    break
+
+        if split_at <= 0:
+            split_at = len(window)
+
+        tail = paragraph[start + split_at :].strip()
+        if tail and len(tail) < 12:
+            split_at = len(paragraph) - start
+
+        item = paragraph[start : start + split_at].strip()
+        if item:
+            result.append(item)
+        start += split_at
+        while start < len(paragraph) and paragraph[start].isspace():
+            start += 1
+
+    return result
+
+
+def normalize_to_wav(audio_path, output_dir):
+    if not AFCONVERT.is_file():
+        raise RuntimeError("/usr/bin/afconvert is required for segmented transcription")
+    wav_path = output_dir / "normalized.wav"
+    command = [
+        str(AFCONVERT),
+        "-f",
+        "WAVE",
+        "-d",
+        "LEI16@16000",
+        "-c",
+        "1",
+        str(audio_path),
+        str(wav_path),
+    ]
+    proc = subprocess.run(command, text=True, capture_output=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "afconvert failed")
+    return wav_path
+
+
+def frame_rms(samples, frame_size, hop_size):
+    if len(samples) <= frame_size:
+        return np.array([float(np.sqrt(np.mean(samples * samples) + 1e-12))], dtype=np.float32)
+
+    values = []
+    for start in range(0, len(samples) - frame_size + 1, hop_size):
+        frame = samples[start : start + frame_size]
+        values.append(float(np.sqrt(np.mean(frame * frame) + 1e-12)))
+    return np.array(values, dtype=np.float32)
+
+
+def rms_db_threshold(samples, sample_rate):
+    frame_size = max(int(sample_rate * 0.03), 1)
+    hop_size = max(int(sample_rate * 0.01), 1)
+    rms = frame_rms(samples, frame_size, hop_size)
+    if len(rms) == 0:
+        return np.array([], dtype=np.float32), -35.0, frame_size, hop_size
+
+    db = 20 * np.log10(np.maximum(rms, 1e-8))
+    threshold = min(-35.0, float(np.percentile(db, 35)) + 6.0)
+    return db, threshold, frame_size, hop_size
+
+
+def detect_silence_midpoints(samples, sample_rate, min_silence_sec=0.45):
+    db, threshold, _, hop_size = rms_db_threshold(samples, sample_rate)
+    if len(db) == 0:
+        return []
+
+    silent = db < threshold
+    min_frames = max(int(min_silence_sec / 0.01), 1)
+
+    midpoints = []
+    start = None
+    for index, is_silent in enumerate(silent):
+        if is_silent and start is None:
+            start = index
+        elif not is_silent and start is not None:
+            if index - start >= min_frames:
+                midpoints.append(((start + index) / 2.0) * hop_size / sample_rate)
+            start = None
+    if start is not None and len(silent) - start >= min_frames:
+        midpoints.append(((start + len(silent)) / 2.0) * hop_size / sample_rate)
+    return midpoints
+
+
+def merge_intervals(intervals, merge_gap_sec=0.28):
+    if not intervals:
+        return []
+
+    merged = [dict(intervals[0])]
+    for interval in intervals[1:]:
+        previous = merged[-1]
+        if interval["start_sec"] - previous["end_sec"] <= merge_gap_sec:
+            previous["end_sec"] = max(previous["end_sec"], interval["end_sec"])
+        else:
+            merged.append(dict(interval))
+    return merged
+
+
+def detect_speech_intervals(
+    samples,
+    sample_rate,
+    min_speech_sec=0.12,
+    merge_gap_sec=0.28,
+    padding_sec=0.08,
+):
+    duration = len(samples) / sample_rate if sample_rate else 0.0
+    if duration <= 0:
+        return []
+
+    db, threshold, frame_size, hop_size = rms_db_threshold(samples, sample_rate)
+    if len(db) == 0:
+        return []
+
+    speech = db >= threshold
+    min_frames = max(int(min_speech_sec / 0.01), 1)
+
+    intervals = []
+    start = None
+    for index, is_speech in enumerate(speech):
+        if is_speech and start is None:
+            start = index
+        elif not is_speech and start is not None:
+            if index - start >= min_frames:
+                intervals.append(
+                    {
+                        "start_sec": max(0.0, (start * hop_size / sample_rate) - padding_sec),
+                        "end_sec": min(duration, ((index * hop_size + frame_size) / sample_rate) + padding_sec),
+                    }
+                )
+            start = None
+    if start is not None and len(speech) - start >= min_frames:
+        intervals.append(
+            {
+                "start_sec": max(0.0, (start * hop_size / sample_rate) - padding_sec),
+                "end_sec": min(duration, (((len(speech) - 1) * hop_size + frame_size) / sample_rate) + padding_sec),
+            }
+        )
+
+    cleaned = [
+        {
+            "start_sec": round(interval["start_sec"], 3),
+            "end_sec": round(interval["end_sec"], 3),
+        }
+        for interval in merge_intervals(intervals, merge_gap_sec)
+        if interval["end_sec"] - interval["start_sec"] >= min_speech_sec
+    ]
+    return cleaned
+
+
+def choose_cut(start, duration, silence_midpoints, target_sec, max_sec, min_sec):
+    target = min(duration, start + target_sec)
+    lower = min(duration, start + min_sec)
+    upper = min(duration, start + max_sec)
+    candidates = [point for point in silence_midpoints if lower <= point <= upper]
+    if candidates:
+        return min(candidates, key=lambda point: abs(point - target))
+    return target if lower <= target <= upper else upper
+
+
+def build_audio_segments(samples, sample_rate, target_sec=120.0, max_sec=180.0, min_sec=20.0):
+    duration = len(samples) / sample_rate if sample_rate else 0.0
+    if duration <= 0:
+        return [], duration
+    if duration <= max_sec:
+        return [{"index": 1, "start_sec": 0.0, "end_sec": round(duration, 3)}], duration
+
+    silence_midpoints = detect_silence_midpoints(samples, sample_rate)
+    boundaries = [0.0]
+    start = 0.0
+    while duration - start > max_sec:
+        cut = choose_cut(start, duration, silence_midpoints, target_sec, max_sec, min_sec)
+        if cut <= start + 1.0:
+            cut = min(duration, start + target_sec)
+        boundaries.append(cut)
+        start = cut
+    if duration > boundaries[-1]:
+        boundaries.append(duration)
+
+    if len(boundaries) > 2 and boundaries[-1] - boundaries[-2] < min_sec:
+        boundaries.pop(-2)
+
+    return [
+        {
+            "index": index,
+            "start_sec": round(start, 3),
+            "end_sec": round(end, 3),
+        }
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1)
+    ], duration
+
+
+def allocate_paragraph_segments(paragraphs, start_sec, end_sec):
+    if not paragraphs:
+        return []
+    duration = max(end_sec - start_sec, 0.0)
+    if duration <= 0 or len(paragraphs) == 1:
+        return [{"start_sec": round(start_sec, 3), "end_sec": round(end_sec, 3), "text": paragraphs[0]}]
+
+    weights = [max(len(re.sub(r"\s+", "", paragraph)), 1) for paragraph in paragraphs]
+    total_weight = sum(weights)
+    cursor = start_sec
+    segments = []
+    for index, (paragraph, weight) in enumerate(zip(paragraphs, weights)):
+        if index == len(paragraphs) - 1:
+            end = end_sec
+        else:
+            end = cursor + duration * weight / total_weight
+        segments.append({"start_sec": round(cursor, 3), "end_sec": round(end, 3), "text": paragraph})
+        cursor = end
+    return segments
+
+
+def clip_speech_intervals(speech_intervals, start_sec, end_sec):
+    clipped = []
+    for interval in speech_intervals:
+        start = max(start_sec, float(interval["start_sec"]))
+        end = min(end_sec, float(interval["end_sec"]))
+        if end - start > 0.05:
+            clipped.append({"start_sec": round(start, 3), "end_sec": round(end, 3)})
+    return clipped
+
+
+def speech_duration(speech_intervals):
+    return sum(max(float(interval["end_sec"]) - float(interval["start_sec"]), 0.0) for interval in speech_intervals)
+
+
+def time_for_speech_offset(offset, speech_intervals, prefer_end=False):
+    total = speech_duration(speech_intervals)
+    if not speech_intervals:
+        return 0.0
+    if offset <= 0:
+        return float(speech_intervals[0]["start_sec"])
+    if offset >= total:
+        return float(speech_intervals[-1]["end_sec"])
+
+    cursor = 0.0
+    epsilon = 1e-6
+    for index, interval in enumerate(speech_intervals):
+        start = float(interval["start_sec"])
+        end = float(interval["end_sec"])
+        length = max(end - start, 0.0)
+        next_cursor = cursor + length
+        if offset < next_cursor - epsilon:
+            return start + (offset - cursor)
+        if abs(offset - next_cursor) <= epsilon:
+            if prefer_end or index == len(speech_intervals) - 1:
+                return end
+            return float(speech_intervals[index + 1]["start_sec"])
+        cursor = next_cursor
+    return float(speech_intervals[-1]["end_sec"])
+
+
+def allocate_paragraph_segments_by_speech(paragraphs, start_sec, end_sec, speech_intervals):
+    fallback = allocate_paragraph_segments(paragraphs, start_sec, end_sec)
+    if not paragraphs:
+        return [], True
+
+    clipped = clip_speech_intervals(speech_intervals, start_sec, end_sec)
+    total_speech = speech_duration(clipped)
+    if total_speech <= 0.2:
+        return fallback, True
+
+    if len(paragraphs) == 1:
+        return [
+            {
+                "start_sec": round(float(clipped[0]["start_sec"]), 3),
+                "end_sec": round(float(clipped[-1]["end_sec"]), 3),
+                "text": paragraphs[0],
+            }
+        ], False
+
+    weights = [max(len(re.sub(r"\s+", "", paragraph)), 1) for paragraph in paragraphs]
+    total_weight = sum(weights)
+    cursor = 0.0
+    segments = []
+    for index, (paragraph, weight) in enumerate(zip(paragraphs, weights)):
+        start_offset = cursor
+        if index == len(paragraphs) - 1:
+            end_offset = total_speech
+        else:
+            end_offset = min(total_speech, cursor + total_speech * weight / total_weight)
+
+        start = time_for_speech_offset(start_offset, clipped, prefer_end=False)
+        end = time_for_speech_offset(end_offset, clipped, prefer_end=True)
+        if end < start:
+            return fallback, True
+
+        segments.append(
+            {
+                "start_sec": round(start, 3),
+                "end_sec": round(end, 3),
+                "text": paragraph,
+            }
+        )
+        cursor = end_offset
+
+    for left, right in zip(segments, segments[1:]):
+        if left["end_sec"] > right["start_sec"]:
+            return fallback, True
+    return segments, False
+
+
+def write_chunk(samples, sample_rate, segment, chunk_dir):
+    start_sample = max(0, int(segment["start_sec"] * sample_rate))
+    end_sample = min(len(samples), int(segment["end_sec"] * sample_rate))
+    chunk_path = chunk_dir / f"chunk-{segment['index']:04d}.wav"
+    sf.write(chunk_path, samples[start_sample:end_sample], sample_rate, subtype="PCM_16")
+    return chunk_path
+
+
+def transcribe(request):
+    output_dir = Path(request["output_dir"]).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        audio_path = Path(request["audio_path"]).expanduser()
+        if not audio_path.exists():
+            raise RuntimeError(f"audio file not found: {audio_path}")
+        if not MODEL_ROOT.exists():
+            raise RuntimeError(f"bundled model not found: {MODEL_ROOT}")
+
+        emit(
+            {
+                "type": "progress",
+                "request_id": request["request_id"],
+                "task_id": request["task_id"],
+                "stage": "preparing",
+                "completed_segments": 0,
+                "total_segments": 1,
+            }
+        )
+
+        work_dir = output_dir / "audio-segments"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = normalize_to_wav(audio_path, work_dir)
+        samples, sample_rate = sf.read(wav_path, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples[:, 0]
+        speech_intervals = detect_speech_intervals(samples, sample_rate)
+        total_speech_sec = round(speech_duration(speech_intervals), 3)
+        audio_segments, duration_sec = build_audio_segments(samples, sample_rate)
+        if not audio_segments:
+            raise RuntimeError("audio segmentation produced no segments")
+
+        emit(
+            {
+                "type": "progress",
+                "request_id": request["request_id"],
+                "task_id": request["task_id"],
+                "stage": "loading",
+                "completed_segments": 0,
+                "total_segments": len(audio_segments),
+            }
+        )
+
+        from mlx_audio.stt import load
+
+        started_load = time.time()
+        model = load(str(MODEL_ROOT))
+        load_sec = time.time() - started_load
+        language = normalize_language(request.get("language") or "auto")
+        system_prompt = None
+
+        transcript_segments = []
+        chunk_records = []
+        raw_texts = []
+        cleanup_events = []
+        vad_fallback_chunks = 0
+        chunk_dir = work_dir / "chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        progress_total = len(audio_segments) * 2
+        for segment in audio_segments:
+            chunk_path = write_chunk(samples, sample_rate, segment, chunk_dir)
+            emit(
+                {
+                    "type": "progress",
+                    "request_id": request["request_id"],
+                    "task_id": request["task_id"],
+                    "stage": "transcribing",
+                    "completed_segments": segment["index"] - 1,
+                    "total_segments": progress_total,
+                }
+            )
+            result = generate_one(model, chunk_path, language, system_prompt=system_prompt)
+            text = clean_asr_template_artifacts(output_text(result))
+            if not text:
+                continue
+            text, cleanup = collapse_repeated_sentences(text)
+            if cleanup.get("changed"):
+                cleanup_events.append(
+                    {
+                        "chunk_index": segment["index"],
+                        "removed_repetitions": cleanup["removed_repetitions"],
+                    }
+                )
+            raw_texts.append(text)
+            paragraphs = split_text_into_paragraphs(text) or [text]
+            paragraph_segments, used_fallback = allocate_paragraph_segments_by_speech(
+                paragraphs,
+                segment["start_sec"],
+                segment["end_sec"],
+                speech_intervals,
+            )
+            if used_fallback:
+                vad_fallback_chunks += 1
+            transcript_segments.extend(paragraph_segments)
+            chunk_records.append(
+                {
+                    "index": segment["index"],
+                    "start_sec": segment["start_sec"],
+                    "end_sec": segment["end_sec"],
+                    "audio_path": str(chunk_path),
+                    "text": text,
+                    "paragraphs": paragraphs,
+                    "fallback_segments": paragraph_segments,
+                }
+            )
+            emit(
+                {
+                    "type": "progress",
+                    "request_id": request["request_id"],
+                    "task_id": request["task_id"],
+                    "stage": "transcribing",
+                    "completed_segments": segment["index"],
+                    "total_segments": progress_total,
+                }
+            )
+
+        if not transcript_segments:
+            raise RuntimeError("asr runtime produced empty transcript")
+
+        del model
+        release_mlx_memory()
+
+        fallback_timestamp_method = (
+            "vad_speech_weighted_paragraph"
+            if vad_fallback_chunks < len(audio_segments)
+            else "audio_segmented"
+        )
+        timestamp_method = fallback_timestamp_method
+        alignment_metadata = None
+
+        def emit_alignment_progress(completed_segments, total_segments):
+            emit(
+                {
+                    "type": "progress",
+                    "request_id": request["request_id"],
+                    "task_id": request["task_id"],
+                    "stage": "aligning",
+                    "completed_segments": len(audio_segments) + completed_segments,
+                    "total_segments": progress_total,
+                }
+            )
+
+        try:
+            alignment_result = refine_segments_with_alignment(
+                chunk_records,
+                output_dir,
+                language=language,
+                progress_callback=emit_alignment_progress,
+            )
+            alignment_metadata = alignment_result.get("metadata")
+            if alignment_result.get("timestamp_method"):
+                timestamp_method = alignment_result["timestamp_method"]
+                transcript_segments = alignment_result.get("segments") or transcript_segments
+        except Exception as exc:
+            alignment_metadata = {
+                "enabled": True,
+                "engine": "qwen3_forced_aligner",
+                "runtime": "mlx_audio",
+                "status": "error_fallback_estimated",
+                "chunk_count": len(chunk_records),
+                "aligned_chunk_count": 0,
+                "failed_chunk_count": len(chunk_records),
+                "error": repr(exc)[:500],
+            }
+
+        transcript = {
+            "task_id": request["task_id"],
+            "audio_duration_sec": round(duration_sec, 3),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "segments": transcript_segments,
+            "text": "\n".join(raw_texts).strip(),
+            "metadata": {
+                "pipeline": "macos_afconvert_segmented",
+                "timestamp_method": timestamp_method,
+                "fallback_timestamp_method": fallback_timestamp_method,
+                "segment_count": len(audio_segments),
+                "load_sec": load_sec,
+                "alignment": alignment_metadata,
+                "vad": {
+                    "engine": "rms_dynamic_threshold",
+                    "speech_interval_count": len(speech_intervals),
+                    "speech_sec": total_speech_sec,
+                    "speech_ratio": round(total_speech_sec / duration_sec, 4) if duration_sec else 0.0,
+                    "fallback_chunk_count": vad_fallback_chunks,
+                },
+                "asr_cleanup": {
+                    "enabled": True,
+                    "rule": "collapse_consecutive_identical_sentences_min4_keep1",
+                    "changed_chunk_count": len(cleanup_events),
+                    "removed_repetition_count": sum(
+                        event["removed_repetitions"] for event in cleanup_events
+                    ),
+                },
+            },
+        }
+        transcript = apply_itn_to_transcript(transcript, language)
+        transcript_path = output_dir / "transcript.json"
+        transcript_path.write_text(
+            json.dumps(transcript, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        emit(
+            {
+                "type": "completed",
+                "request_id": request["request_id"],
+                "task_id": request["task_id"],
+                "transcript_path": str(transcript_path),
+                "duration_sec": transcript["audio_duration_sec"],
+            }
+        )
+    except Exception as exc:
+        fail(request, output_dir, "asr_runtime_error", repr(exc))
+
+
+def main():
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        request = json.loads(line)
+        if request.get("type") != "transcribe":
+            fail(request, Path(request.get("output_dir", ".")), "unsupported_request", "unsupported request")
+            continue
+        transcribe(request)
+
+
+if __name__ == "__main__":
+    main()

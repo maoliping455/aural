@@ -1,0 +1,8 @@
+Aural
+Copyright 2026 Liping Mao
+
+This product includes software developed for the Aural project.
+
+Release builds may include third-party models, Python packages, and native
+libraries. Their licenses are listed in THIRD_PARTY_NOTICES.md and should be
+reviewed before redistributing a bundled app.
