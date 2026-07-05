@@ -46,6 +46,7 @@ scripts/build-local-app.sh --include-runtime --include-model \
 codesign --verify --deep --strict --verbose=2 .build/release/Aural.app
 scripts/package-local-dmg.sh
 scripts/package-release-split.sh .build/release/Aural-0.1.0.dmg
+scripts/publish-github-release.sh
 ```
 
 Attach to the GitHub Release:
