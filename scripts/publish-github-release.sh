@@ -19,7 +19,10 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-mapfile -t parts < <(find "$RELEASE_DIR" -maxdepth 1 -type f -name 'Aural-0.1.0-*.dmg.part-*' | sort)
+parts=()
+while IFS= read -r part; do
+  parts+=("$part")
+done < <(find "$RELEASE_DIR" -maxdepth 1 -type f -name 'Aural-0.1.0-*.dmg.part-*' | sort)
 if [[ "${#parts[@]}" -eq 0 ]]; then
   echo "No split release assets found in $RELEASE_DIR" >&2
   echo "Run scripts/package-release-split.sh .build/release/Aural-0.1.0-<timestamp>.dmg first." >&2
