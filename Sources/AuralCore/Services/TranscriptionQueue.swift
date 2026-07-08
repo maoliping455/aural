@@ -61,6 +61,17 @@ public final class TranscriptionQueue {
             guard var latest = try currentRunningTask(task.id, store: store) else {
                 return currentTaskOrOriginal(task, store: store)
             }
+            do {
+                try validateCompletedTranscript(completed, expectedTask: latest, store: store)
+            } catch {
+                latest.status = .failed
+                latest.failedAt = Date()
+                latest.transcriptPath = nil
+                latest.errorLogPath = ensureFailureLog(outputDir: outputDir, error: error)
+                latest.progressFraction = nil
+                try store.update(latest)
+                return latest
+            }
             latest.status = .done
             latest.completedAt = Date()
             latest.transcriptPath = completed.transcriptPath
@@ -74,11 +85,12 @@ public final class TranscriptionQueue {
             if try currentTask(task.id, store: store)?.status == .paused {
                 return currentTaskOrOriginal(task, store: store)
             }
-            task.status = .failed
-            task.failedAt = Date()
-            task.errorLogPath = ensureFailureLog(outputDir: outputDir, error: error)
-            task.progressFraction = nil
-            try store.update(task)
+            var latest = try currentTask(task.id, store: store) ?? task
+            latest.status = .failed
+            latest.failedAt = Date()
+            latest.errorLogPath = ensureFailureLog(outputDir: outputDir, error: error)
+            latest.progressFraction = nil
+            try store.update(latest)
             throw error
         }
     }
@@ -94,15 +106,57 @@ public final class TranscriptionQueue {
 
     private func ensureFailureLog(outputDir: URL, error: Error) -> String {
         let errorLogURL = outputDir.appendingPathComponent("error.log")
-        if FileManager.default.fileExists(atPath: errorLogURL.path) {
-            return errorLogURL.path
-        }
-
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let text = "[\(timestamp)] \(String(describing: error))\n"
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
-        try? Data(text.utf8).write(to: errorLogURL, options: .atomic)
+        if FileManager.default.fileExists(atPath: errorLogURL.path),
+           let handle = try? FileHandle(forWritingTo: errorLogURL) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: errorLogURL, options: .atomic)
+        }
         return errorLogURL.path
+    }
+}
+
+private enum CompletedTranscriptValidationError: Error, CustomStringConvertible {
+    case missingTranscriptPath
+    case transcriptFileMissing(String)
+    case unreadableTranscript(String, String)
+    case emptyTranscript(String)
+    case invalidTranscript(String)
+
+    var description: String {
+        switch self {
+        case .missingTranscriptPath:
+            return "completed event produced no transcript path"
+        case .transcriptFileMissing(let path):
+            return "completed event transcript file is missing: \(path)"
+        case .unreadableTranscript(let path, let reason):
+            return "completed event transcript is unreadable: \(path); \(reason)"
+        case .emptyTranscript(let path):
+            return "completed event transcript is empty: \(path)"
+        case .invalidTranscript(let reason):
+            return reason
+        }
+    }
+}
+
+private func validateCompletedTranscript(_ event: WorkerEvent, expectedTask: TranscriptionTask, store: TaskStore) throws {
+    guard let transcriptPath = event.transcriptPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !transcriptPath.isEmpty else {
+        throw CompletedTranscriptValidationError.missingTranscriptPath
+    }
+
+    let transcriptURL = URL(fileURLWithPath: transcriptPath)
+    guard FileManager.default.fileExists(atPath: transcriptURL.path) else {
+        throw CompletedTranscriptValidationError.transcriptFileMissing(transcriptURL.path)
+    }
+
+    if let reason = store.transcriptValidationReason(for: expectedTask, transcriptURL: transcriptURL) {
+        throw CompletedTranscriptValidationError.invalidTranscript("completed event transcript is invalid: \(reason)")
     }
 }
 

@@ -37,10 +37,17 @@ If a task is playing when deleted, playback is stopped before the task files are
 
 The app stores task data under the macOS Application Support directory for Aural.
 
-Release builds may include local model and runtime files inside the app bundle. Those files are used for local transcription only.
+Release builds include local runtime files inside the app bundle. Model files are stored under the app's Application Support model cache after first-run preparation.
 
 ## Network
 
-Aural's product path does not require network access for transcription after the bundled release is installed.
+Aural does not use network access to upload, analyze, or transcribe user media.
+
+0.1.0 may use network access on first launch to download local model resources when they are missing. The download path is:
+
+- ModelScope first.
+- Hugging Face fallback if ModelScope fails.
+
+After the model resources are present locally, transcription runs locally without cloud ASR.
 
 Source builds may require network access only when the developer chooses to download runtime dependencies or model files outside this repository.

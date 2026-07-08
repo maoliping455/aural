@@ -13,6 +13,9 @@ ALIGNER_MODEL_SOURCE="${AURAL_ALIGNER_MODEL_SOURCE:-}"
 FFMPEG_SOURCE="${AURAL_FFMPEG_SOURCE:-}"
 FFPROBE_SOURCE="${AURAL_FFPROBE_SOURCE:-}"
 ITN_FST_SOURCE="${AURAL_ITN_FST_SOURCE:-}"
+CODE_SIGN_IDENTITY="${AURAL_CODESIGN_IDENTITY:-}"
+CODE_SIGN_ENTITLEMENTS="${AURAL_CODESIGN_ENTITLEMENTS:-}"
+CODE_SIGN_REQUIRE_DEVELOPER_ID="${AURAL_CODESIGN_REQUIRE_DEVELOPER_ID:-0}"
 APP_DIR="$ROOT_DIR/.build/$CONFIGURATION/Aural.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
@@ -99,23 +102,64 @@ copy_homebrew_binary_with_deps() {
   rm -f "$processed_file_list"
 }
 
-prune_ocr_runtime_payload() {
+prune_runtime_payload() {
   local runtime_dir="$1"
   [[ -d "$runtime_dir/.venv/lib" ]] || return 0
 
   while IFS= read -r site_packages_dir; do
-    find "$site_packages_dir" -maxdepth 1 \
-      \( \
-        -name 'rapidocr*' \
-        -o -name 'onnxruntime*' \
-        -o -name 'opencv_python*' \
-        -o -name 'cv2' \
-        -o -name 'pyclipper*' \
-        -o -name 'shapely*' \
-        -o -name 'Shapely*' \
-      \) \
-      -exec rm -rf {} +
+    local patterns=(
+      'rapidocr*'
+      'onnxruntime*'
+      'opencv_python*'
+      'cv2'
+      'pyclipper*'
+      'shapely*'
+      'Shapely*'
+      'torch'
+      'torch-*dist-info'
+      'torchgen'
+      'functorch'
+      'torchaudio'
+      'torchaudio-*dist-info'
+      'torchcodec'
+      'torchcodec-*dist-info'
+      'torch_complex'
+      'torch_complex-*dist-info'
+      'pyarrow'
+      'pyarrow-*dist-info'
+      'pandas'
+      'pandas-*dist-info'
+      'sklearn'
+      'scikit_learn-*dist-info'
+      'scipy'
+      'scipy-*dist-info'
+      'llvmlite'
+      'llvmlite-*dist-info'
+      'numba'
+      'numba-*dist-info'
+      'sherpa_onnx'
+      'sherpa_onnx-*dist-info'
+      'sherpa_onnx_core-*dist-info'
+      'datasets'
+      'datasets-*dist-info'
+      'funasr'
+      'funasr-*dist-info'
+      'yt_dlp'
+      'yt_dlp-*dist-info'
+      'librosa'
+      'librosa-*dist-info'
+    )
+
+    local pattern
+    for pattern in "${patterns[@]}"; do
+      while IFS= read -r item; do
+        rm -rf "$item"
+      done < <(find "$site_packages_dir" -maxdepth 1 -name "$pattern" -print)
+    done
   done < <(find "$runtime_dir/.venv/lib" -type d -name site-packages)
+
+  find "$runtime_dir" -name '__pycache__' -type d -prune -exec rm -rf {} +
+  find "$runtime_dir" -name '*.pyc' -type f -delete
 }
 
 while [[ $# -gt 0 ]]; do
@@ -152,6 +196,18 @@ while [[ $# -gt 0 ]]; do
       ITN_FST_SOURCE="$2"
       shift 2
       ;;
+    --codesign-identity)
+      CODE_SIGN_IDENTITY="$2"
+      shift 2
+      ;;
+    --codesign-entitlements)
+      CODE_SIGN_ENTITLEMENTS="$2"
+      shift 2
+      ;;
+    --require-developer-id)
+      CODE_SIGN_REQUIRE_DEVELOPER_ID=1
+      shift
+      ;;
     *)
       echo "unknown argument: $1" >&2
       exit 2
@@ -175,6 +231,7 @@ cp "$ROOT_DIR/AuralASRWorker/worker_qwen_direct_bundle.py" "$RESOURCES_DIR/Aural
 cp "$ROOT_DIR/AuralASRWorker/worker_qwen_dev.py" "$RESOURCES_DIR/AuralASRWorker/worker_qwen_dev.py"
 cp "$ROOT_DIR/AuralASRWorker/itn_postprocess.py" "$RESOURCES_DIR/AuralASRWorker/itn_postprocess.py"
 cp "$ROOT_DIR/AuralASRWorker/alignment_postprocess.py" "$RESOURCES_DIR/AuralASRWorker/alignment_postprocess.py"
+cp "$ROOT_DIR/AuralASRWorker/model_resource_prepare.py" "$RESOURCES_DIR/AuralASRWorker/model_resource_prepare.py"
 chmod +x "$RESOURCES_DIR/AuralASRWorker/"*.py
 
 mkdir -p "$RESOURCES_DIR/itn"
@@ -219,7 +276,7 @@ PY
   rm -rf "$RESOURCES_DIR/runtime/.venv" "$RESOURCES_DIR/runtime/cpython"
   ditto "$VENV_SOURCE" "$RESOURCES_DIR/runtime/.venv"
   ditto "$PYTHON_BASE_SOURCE" "$RESOURCES_DIR/runtime/cpython"
-  prune_ocr_runtime_payload "$RESOURCES_DIR/runtime"
+  prune_runtime_payload "$RESOURCES_DIR/runtime"
 
   mkdir -p "$RESOURCES_DIR/runtime/bin"
   rm -f "$RESOURCES_DIR/runtime/.venv/bin/python" \
@@ -240,6 +297,8 @@ exec "$RUNTIME_DIR/cpython/bin/python3.12" "$@"
 PYWRAPPER
   chmod +x "$RESOURCES_DIR/runtime/bin/python3"
   ln -sf python3 "$RESOURCES_DIR/runtime/bin/python"
+
+  bash "$ROOT_DIR/scripts/audit-runtime-compatibility.sh" "$APP_DIR"
 fi
 
 if [[ "$INCLUDE_HOMEBREW_FFMPEG" -eq 1 ]]; then
@@ -330,7 +389,23 @@ find "$APP_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$APP_DIR" -name '*.pyc' -type f -delete
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null
+  if [[ -n "$CODE_SIGN_IDENTITY" ]]; then
+    codesign_args=(--force --deep --options runtime --timestamp --sign "$CODE_SIGN_IDENTITY")
+    if [[ -n "$CODE_SIGN_ENTITLEMENTS" ]]; then
+      if [[ ! -f "$CODE_SIGN_ENTITLEMENTS" ]]; then
+        echo "codesign entitlements not found: $CODE_SIGN_ENTITLEMENTS" >&2
+        exit 1
+      fi
+      codesign_args+=(--entitlements "$CODE_SIGN_ENTITLEMENTS")
+    fi
+    codesign "${codesign_args[@]}" "$APP_DIR" >/dev/null
+  else
+    if [[ "$CODE_SIGN_REQUIRE_DEVELOPER_ID" == "1" ]]; then
+      echo "AURAL_CODESIGN_IDENTITY or --codesign-identity is required for a Developer ID release build" >&2
+      exit 1
+    fi
+    codesign --force --deep --sign - "$APP_DIR" >/dev/null
+  fi
 fi
 
 echo "$APP_DIR"

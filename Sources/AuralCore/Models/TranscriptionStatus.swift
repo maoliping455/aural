@@ -14,7 +14,7 @@ public enum TranscriptionStatus: String, Codable, CaseIterable, Sendable {
         case .running:
             "转写中"
         case .paused:
-            "已暂停"
+            "已停止"
         case .done:
             "转写完成"
         case .failed:

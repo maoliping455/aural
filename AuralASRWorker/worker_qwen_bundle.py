@@ -13,7 +13,23 @@ from itn_postprocess import apply_itn_to_transcript
 
 RESOURCES_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_ROOT = RESOURCES_ROOT / "runtime"
-MODEL_ROOT = RESOURCES_ROOT / "asr-models" / "qwen3-asr-1.7b-4bit"
+ASR_MODEL_DIRECTORIES = {
+    "fast": "qwen3-asr-0.6b-4bit",
+    "balanced": "qwen3-asr-1.7b-4bit",
+    "accurate": "qwen3-asr-1.7b-bf16",
+}
+
+
+def resolve_asr_model_root():
+    override = os.environ.get("AURAL_ASR_MODEL")
+    if override:
+        return Path(override).expanduser()
+    profile = os.environ.get("AURAL_MODEL_PROFILE", "balanced")
+    directory = ASR_MODEL_DIRECTORIES.get(profile, ASR_MODEL_DIRECTORIES["balanced"])
+    model_root = os.environ.get("AURAL_MODEL_ROOT")
+    if model_root:
+        return Path(model_root).expanduser() / directory
+    return RESOURCES_ROOT / "asr-models" / directory
 
 
 def emit(event):
@@ -176,8 +192,9 @@ def run_asr(request, output_dir):
         raise RuntimeError(f"bundled runtime python not found under {RUNTIME_ROOT}")
     if asr_script is None:
         raise RuntimeError(f"bundled ASR script not found under {RUNTIME_ROOT}")
-    if not MODEL_ROOT.exists():
-        raise RuntimeError(f"bundled model not found: {MODEL_ROOT}")
+    model_root = resolve_asr_model_root()
+    if not model_root.exists():
+        raise RuntimeError(f"local ASR model not found: {model_root}")
 
     pipeline = request.get("pipeline") or "vad_chunked"
     if pipeline == "auto":
@@ -188,7 +205,7 @@ def run_asr(request, output_dir):
         str(asr_script),
         str(audio_path),
         "--model",
-        str(MODEL_ROOT),
+        str(model_root),
         "--language",
         request.get("language") or "auto",
         "--out-dir",

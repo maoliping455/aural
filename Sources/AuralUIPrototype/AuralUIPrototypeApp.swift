@@ -12,7 +12,19 @@ struct AuralUIPrototypeApp: App {
                 .background(AuralTitlebarInstaller())
         }
         .windowStyle(.titleBar)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("本地转写设置...") {
+                    NotificationCenter.default.post(name: .openAuralResourceSettings, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+        }
     }
+}
+
+private extension Notification.Name {
+    static let openAuralResourceSettings = Notification.Name("io.github.maoliping455.aural.openResourceSettings")
 }
 
 struct AuralWindowTitleView: View {
@@ -186,6 +198,11 @@ final class AuralAppModel: ObservableObject {
     @Published var selectedTaskIDs: Set<UUID> = []
     @Published var isRunning = false
     @Published var importFeedback: ImportFeedback?
+    @Published var resourceStatus: ModelResourceStatus = .checking
+    @Published var isPreparingResources = false
+    @Published var selectedModelProfile: ModelResourceProfile = RuntimePaths.selectedModelProfile()
+    @Published var selectedAlignmentEnabled = RuntimePaths.selectedAlignmentEnabled()
+    @Published var isShowingSettings = false
 
     private let dataRoot: URL
     private let workerURL: URL
@@ -198,6 +215,8 @@ final class AuralAppModel: ObservableObject {
     private let processingRateSmoothingAlpha = 0.18
     private var pendingImportURLs: [URL] = []
     private var isImportingFiles = false
+    private var modelDownloadBaselineBytes: UInt64?
+    private var modelDownloadBaselineDate: Date?
 
     init() {
         let dataRoot = RuntimePaths.defaultDataRoot()
@@ -216,8 +235,10 @@ final class AuralAppModel: ObservableObject {
         }
         _ = try? store.recoverInterruptedTasks()
         _ = try? store.repairLocalAudioDurations()
+        _ = try? store.repairFailedTasksWithValidTranscript()
+        _ = try? store.repairInvalidCompletedTasks()
         reload(forceRateRefresh: true)
-        runQueue()
+        refreshLocalResourceState()
     }
 
     var selectedTask: TranscriptionTask? {
@@ -240,12 +261,12 @@ final class AuralAppModel: ObservableObject {
         tasks.filter { selectedTaskIDs.contains($0.id) }
     }
 
-    var canPauseSelectedTasks: Bool {
+    var canStopSelectedTasks: Bool {
         selectedTasks.contains { $0.status == .pending || $0.status == .running }
     }
 
-    var canResumeSelectedTasks: Bool {
-        selectedTasks.contains { $0.status == .paused }
+    var canStartSelectedTasks: Bool {
+        selectedTasks.contains { $0.status == .paused || $0.status == .failed }
     }
 
     var canDeleteSelectedTasks: Bool {
@@ -256,23 +277,60 @@ final class AuralAppModel: ObservableObject {
         selectedTasks.contains { isTaskExportable($0) }
     }
 
+    var resourcesReady: Bool {
+        resourceStatus.phase == .ready
+    }
+
+    var allowsModelProfileSelection: Bool {
+        resourceStatus.phase == .needsDownload
+            && !isPreparingResources
+    }
+
+    var allowsAlignmentSelection: Bool {
+        resourceStatus.phase == .needsDownload
+            && !isPreparingResources
+    }
+
     func reload(forceRateRefresh: Bool = false) {
         do {
-            tasks = try store.load()
-            let liveTaskIDs = Set(tasks.map(\.id))
-            selectedTaskIDs.formIntersection(liveTaskIDs)
-            if selectedTaskID.map({ !liveTaskIDs.contains($0) }) ?? true {
-                selectedTaskID = tasks.first?.id
+            let nextTasks = try store.load()
+            let liveTaskIDs = Set(nextTasks.map(\.id))
+            if tasks != nextTasks {
+                tasks = nextTasks
+            }
+
+            let nextSelectedTaskIDs = selectedTaskIDs.intersection(liveTaskIDs)
+            if nextSelectedTaskIDs != selectedTaskIDs {
+                selectedTaskIDs = nextSelectedTaskIDs
+            }
+
+            let nextSelectedTaskID: UUID?
+            if let selectedTaskID, liveTaskIDs.contains(selectedTaskID) {
+                nextSelectedTaskID = selectedTaskID
+            } else {
+                nextSelectedTaskID = nextTasks.first?.id
+            }
+            if nextSelectedTaskID != selectedTaskID {
+                selectedTaskID = nextSelectedTaskID
             }
             refreshProcessingRateIfNeeded(force: forceRateRefresh)
         } catch {
-            tasks = []
-            selectedTaskID = nil
-            selectedTaskIDs.removeAll()
+            if !tasks.isEmpty {
+                tasks = []
+            }
+            if selectedTaskID != nil {
+                selectedTaskID = nil
+            }
+            if !selectedTaskIDs.isEmpty {
+                selectedTaskIDs.removeAll()
+            }
         }
     }
 
     func addFiles(_ urls: [URL]) {
+        guard resourcesReady else {
+            return
+        }
         guard !urls.isEmpty else {
             return
         }
@@ -337,6 +395,9 @@ final class AuralAppModel: ObservableObject {
     }
 
     func chooseFiles() {
+        guard resourcesReady else {
+            return
+        }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
@@ -345,6 +406,301 @@ final class AuralAppModel: ObservableObject {
         if panel.runModal() == .OK {
             addFiles(panel.urls)
         }
+    }
+
+    func refreshLocalResourceState() {
+        guard !isPreparingResources else {
+            return
+        }
+
+        let configuration = RuntimePaths.selectedResourceConfiguration()
+        selectedModelProfile = configuration.profile
+        selectedAlignmentEnabled = configuration.alignmentEnabled
+
+        if let compatibilityStatus = RuntimeCompatibility.blockingStatus() {
+            resourceStatus = compatibilityStatus
+            return
+        }
+
+        let preparer = ModelResourcePreparer(
+            profile: selectedModelProfile,
+            alignmentEnabled: selectedAlignmentEnabled
+        )
+        if let runtimeStatus = preparer.runtimeProbeStatus() {
+            resourceStatus = runtimeStatus
+            return
+        }
+
+        if preparer.resourcesAreReady() {
+            resourceStatus = .ready
+            runQueue()
+            return
+        }
+
+        resourceStatus = .needsDownload(
+            configuration: ModelResourceConfiguration(
+                profile: selectedModelProfile,
+                alignmentEnabled: selectedAlignmentEnabled
+            ),
+            allowsProfileSelection: true
+        )
+    }
+
+    func prepareLocalResources() {
+        guard !isPreparingResources else {
+            return
+        }
+
+        if let compatibilityStatus = RuntimeCompatibility.blockingStatus() {
+            resourceStatus = compatibilityStatus
+            return
+        }
+
+        let profile = RuntimeCompatibility.effectiveProfile(selectedModelProfile)
+        selectedModelProfile = profile
+        let configuration = ModelResourceConfiguration(
+            profile: profile,
+            alignmentEnabled: selectedAlignmentEnabled
+        )
+        do {
+            try RuntimePaths.saveSelectedResourceConfiguration(configuration)
+        } catch {
+            resourceStatus = ModelResourceStatus(
+                phase: .failed,
+                title: "本地转写资源准备失败",
+                detail: "无法保存本地模型选择，请检查磁盘权限后重试。"
+            )
+            return
+        }
+
+        let preparer = ModelResourcePreparer(
+            profile: profile,
+            alignmentEnabled: selectedAlignmentEnabled
+        )
+        if let runtimeStatus = preparer.runtimeProbeStatus() {
+            resourceStatus = runtimeStatus
+            return
+        }
+
+        if preparer.resourcesAreReady() {
+            resourceStatus = .ready
+            runQueue()
+            return
+        }
+
+        isPreparingResources = true
+        modelDownloadBaselineBytes = nil
+        modelDownloadBaselineDate = nil
+        resourceStatus = .checking
+        let model = self
+        Task.detached(priority: .utility) { [model, preparer] in
+            do {
+                try preparer.prepare { event in
+                    Task { @MainActor [model] in
+                        model.handleModelResourceEvent(event)
+                    }
+                }
+                await MainActor.run { [model] in
+                    model.isPreparingResources = false
+                    model.modelDownloadBaselineBytes = nil
+                    model.modelDownloadBaselineDate = nil
+                    model.resourceStatus = .ready
+                    model.runQueue()
+                }
+            } catch {
+                await MainActor.run { [model] in
+                    model.isPreparingResources = false
+                    model.modelDownloadBaselineBytes = nil
+                    model.modelDownloadBaselineDate = nil
+                    model.resourceStatus = model.resourcePreparationFailureStatus(for: error)
+                }
+            }
+        }
+    }
+
+    private func resourcePreparationFailureStatus(for error: Error) -> ModelResourceStatus {
+        if let preparerError = error as? ModelResourcePreparer.PreparerError,
+           case .runtimeIncompatible = preparerError {
+            return ModelResourceStatus(
+                phase: .failed,
+                title: "当前系统暂不支持本地转写",
+                detail: "Aural 的本地转写运行时无法在当前系统加载。请升级 macOS，或安装兼容当前系统的 Aural 版本。",
+                allowsRetry: false
+            )
+        }
+
+        return ModelResourceStatus(
+            phase: .failed,
+            title: "本地转写资源准备失败",
+            detail: "请检查网络后重试。已下载的部分会保留，下次会继续下载。"
+        )
+    }
+
+    func selectModelProfile(_ profile: ModelResourceProfile) {
+        guard allowsModelProfileSelection else {
+            return
+        }
+        selectedModelProfile = RuntimeCompatibility.effectiveProfile(profile)
+        resourceStatus = .needsDownload(
+            configuration: ModelResourceConfiguration(
+                profile: selectedModelProfile,
+                alignmentEnabled: selectedAlignmentEnabled
+            ),
+            allowsProfileSelection: true
+        )
+    }
+
+    func setAlignmentEnabled(_ enabled: Bool) {
+        guard allowsAlignmentSelection else {
+            return
+        }
+        selectedAlignmentEnabled = enabled
+        resourceStatus = .needsDownload(
+            configuration: ModelResourceConfiguration(
+                profile: selectedModelProfile,
+                alignmentEnabled: selectedAlignmentEnabled
+            ),
+            allowsProfileSelection: true
+        )
+    }
+
+    func applyResourceConfiguration(
+        profile: ModelResourceProfile,
+        alignmentEnabled: Bool,
+        prepareIfNeeded: Bool
+    ) {
+        selectedModelProfile = RuntimeCompatibility.effectiveProfile(profile)
+        selectedAlignmentEnabled = alignmentEnabled
+        do {
+            try RuntimePaths.saveSelectedResourceConfiguration(
+                ModelResourceConfiguration(
+                    profile: selectedModelProfile,
+                    alignmentEnabled: selectedAlignmentEnabled
+                )
+            )
+        } catch {
+            resourceStatus = ModelResourceStatus(
+                phase: .failed,
+                title: "本地转写资源准备失败",
+                detail: "无法保存本地模型选择，请检查磁盘权限后重试。"
+            )
+            return
+        }
+
+        refreshLocalResourceState()
+        if prepareIfNeeded, resourceStatus.phase == .needsDownload {
+            prepareLocalResources()
+        }
+    }
+
+    private func handleModelResourceEvent(_ event: ModelResourceEvent) {
+        switch event.type {
+        case "checking":
+            resourceStatus = .checking
+        case "download_started":
+            resourceStatus = ModelResourceStatus(
+                phase: .downloading,
+                title: "正在准备本地模型",
+                detail: "",
+                progressFraction: resourceStatus.progressFraction,
+                remainingTimeText: resourceStatus.remainingTimeText
+            )
+        case "download_progress":
+            let progress = event.progress.map { min(max($0, 0), 1) }
+            let remainingTimeText = estimatedModelDownloadRemainingTimeText(for: event)
+            resourceStatus = ModelResourceStatus(
+                phase: .downloading,
+                title: "正在准备本地模型",
+                detail: "",
+                progressFraction: progress,
+                remainingTimeText: remainingTimeText
+            )
+        case "download_retry":
+            resourceStatus = ModelResourceStatus(
+                phase: .downloading,
+                title: "正在准备本地模型",
+                detail: "",
+                progressFraction: resourceStatus.progressFraction,
+                remainingTimeText: resourceStatus.remainingTimeText
+            )
+        case "model_ready":
+            resourceStatus = ModelResourceStatus(
+                phase: .downloading,
+                title: "正在准备本地模型",
+                detail: "",
+                progressFraction: resourceStatus.progressFraction,
+                remainingTimeText: resourceStatus.remainingTimeText
+            )
+        case "completed":
+            resourceStatus = .ready
+        case "failed":
+            resourceStatus = ModelResourceStatus(
+                phase: .failed,
+                title: "本地转写资源准备失败",
+                detail: "请检查网络后重试。已下载的部分会保留，下次会继续下载。"
+            )
+        default:
+            break
+        }
+    }
+
+    private func estimatedModelDownloadRemainingTimeText(for event: ModelResourceEvent) -> String? {
+        guard let downloadedBytes = event.downloadedBytes,
+              let totalBytes = event.totalBytes,
+              totalBytes > downloadedBytes else {
+            return nil
+        }
+
+        let now = Date()
+        if modelDownloadBaselineBytes == nil
+            || modelDownloadBaselineDate == nil
+            || downloadedBytes < (modelDownloadBaselineBytes ?? 0)
+        {
+            modelDownloadBaselineBytes = downloadedBytes
+            modelDownloadBaselineDate = now
+            return nil
+        }
+
+        guard let baselineBytes = modelDownloadBaselineBytes,
+              let baselineDate = modelDownloadBaselineDate else {
+            return nil
+        }
+
+        let elapsedSeconds = now.timeIntervalSince(baselineDate)
+        let downloadedDelta = downloadedBytes > baselineBytes ? downloadedBytes - baselineBytes : 0
+        guard elapsedSeconds >= 2, downloadedDelta > 1_000_000 else {
+            return nil
+        }
+
+        let bytesPerSecond = Double(downloadedDelta) / elapsedSeconds
+        guard bytesPerSecond > 0 else {
+            return nil
+        }
+
+        let remainingBytes = totalBytes - downloadedBytes
+        let remainingSeconds = Double(remainingBytes) / bytesPerSecond
+        guard remainingSeconds.isFinite, remainingSeconds >= 0 else {
+            return nil
+        }
+
+        return formatDownloadRemainingTime(remainingSeconds)
+    }
+
+    private func formatDownloadRemainingTime(_ seconds: TimeInterval) -> String {
+        let roundedSeconds = max(1, Int(seconds.rounded()))
+        if roundedSeconds < 60 {
+            return "还需 \(roundedSeconds) 秒"
+        }
+
+        let minutes = roundedSeconds / 60
+        let secondsPart = roundedSeconds % 60
+        if minutes < 60 {
+            return "还需 \(minutes) 分 \(secondsPart) 秒"
+        }
+
+        let hours = minutes / 60
+        let minutesPart = minutes % 60
+        return "还需 \(hours) 小时 \(minutesPart) 分"
     }
 
     private func showImportFeedback(_ feedback: ImportFeedback) {
@@ -417,13 +773,13 @@ final class AuralAppModel: ObservableObject {
         }
     }
 
-    func pauseSelectedTasks() {
-        _ = try? store.pauseTasks(ids: selectedTaskIDs)
+    func stopSelectedTasks() {
+        _ = try? store.stopTasks(ids: selectedTaskIDs)
         reload()
     }
 
-    func resumeSelectedTasks() {
-        _ = try? store.resumeTasks(ids: selectedTaskIDs)
+    func startSelectedTasks() {
+        _ = try? store.startTasks(ids: selectedTaskIDs)
         reload(forceRateRefresh: true)
         runQueue()
     }
@@ -560,6 +916,9 @@ final class AuralAppModel: ObservableObject {
     }
 
     func runQueue() {
+        guard resourcesReady else {
+            return
+        }
         guard !isRunning else {
             return
         }
@@ -684,24 +1043,322 @@ struct AuralRootView: View {
     @StateObject private var model = AuralAppModel()
 
     var body: some View {
-        HStack(spacing: 0) {
-            TaskListPane(model: model)
-                .frame(minWidth: 460, idealWidth: 580, maxWidth: 780)
+        ZStack {
+            HStack(spacing: 0) {
+                TaskListPane(model: model)
+                    .frame(minWidth: 460, idealWidth: 580, maxWidth: 780)
 
-            Divider()
+                Divider()
 
-            TaskDetailPane(
-                task: model.selectedTask,
-                statusText: model.selectedTask.map { model.statusLabel(for: $0) },
-                onChooseFiles: model.chooseFiles,
-                onRename: { task, filename in
-                    model.renameTask(task, to: filename)
-                }
-            )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                TaskDetailPane(
+                    task: model.selectedTask,
+                    statusText: model.selectedTask.map { model.statusLabel(for: $0) },
+                    onChooseFiles: model.chooseFiles,
+                    onRename: { task, filename in
+                        model.renameTask(task, to: filename)
+                    }
+                )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            if !model.resourcesReady {
+                ModelResourceGateView(
+                    status: model.resourceStatus,
+                    isPreparing: model.isPreparingResources,
+                    selectedProfile: model.selectedModelProfile,
+                    alignmentEnabled: model.selectedAlignmentEnabled,
+                    allowsProfileSelection: model.allowsModelProfileSelection,
+                    allowsAlignmentSelection: model.allowsAlignmentSelection,
+                    onSelectProfile: model.selectModelProfile,
+                    onSetAlignmentEnabled: model.setAlignmentEnabled,
+                    onPrimaryAction: model.prepareLocalResources
+                )
+                .transition(.opacity)
+            }
+        }
+        .sheet(isPresented: $model.isShowingSettings) {
+            ResourceSettingsView(model: model)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openAuralResourceSettings)) { _ in
+            model.isShowingSettings = true
         }
         .frame(minWidth: 1120, minHeight: 720)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+struct ModelResourceGateView: View {
+    let status: ModelResourceStatus
+    let isPreparing: Bool
+    let selectedProfile: ModelResourceProfile
+    let alignmentEnabled: Bool
+    let allowsProfileSelection: Bool
+    let allowsAlignmentSelection: Bool
+    let onSelectProfile: (ModelResourceProfile) -> Void
+    let onSetAlignmentEnabled: (Bool) -> Void
+    let onPrimaryAction: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+                .opacity(0.96)
+                .ignoresSafeArea()
+
+            VStack(spacing: 16) {
+                Image(nsImage: AuralTitleIcon.image)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 56, height: 56)
+                    .accessibilityHidden(true)
+
+                VStack(spacing: 8) {
+                    Text(status.title)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    if !status.detail.isEmpty {
+                        Text(status.detail)
+                            .font(.system(size: 14))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(3)
+                            .frame(maxWidth: 520)
+                    }
+                }
+
+                if status.phase == .downloading {
+                    VStack(spacing: 8) {
+                        ProgressView(value: status.progressFraction ?? 0, total: 1)
+                            .progressViewStyle(.linear)
+                            .frame(width: 360)
+                        Text(progressText)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    .padding(.top, 2)
+                } else if status.phase == .checking {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                } else if status.phase == .needsDownload {
+                    VStack(spacing: 14) {
+                        if allowsProfileSelection {
+                            HStack(spacing: 10) {
+                                ForEach(ModelResourceProfile.allCases, id: \.self) { profile in
+                                    ModelProfileOptionView(
+                                        profile: profile,
+                                        isSelected: profile == selectedProfile,
+                                        isEnabled: profile.isAvailable(),
+                                        onSelect: { onSelectProfile(profile) }
+                                    )
+                                }
+                            }
+                            .frame(width: 560)
+                        }
+
+                        AlignmentOptionRow(
+                            isEnabled: alignmentEnabled,
+                            isInteractive: allowsAlignmentSelection,
+                            onChange: onSetAlignmentEnabled
+                        )
+                        .frame(width: allowsProfileSelection ? 560 : 420)
+
+                        Button(action: onPrimaryAction) {
+                            Text("开始准备")
+                                .font(.system(size: 14, weight: .semibold))
+                                .frame(minWidth: 116)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isPreparing)
+                    }
+                } else if status.phase == .failed, status.allowsRetry {
+                    Button(action: onPrimaryAction) {
+                        Text("重试")
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(minWidth: 96)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isPreparing)
+                } else if status.phase == .failed {
+                    Text("请关注后续版本")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(32)
+        }
+    }
+
+    private var progressText: String {
+        let value = min(max(status.progressFraction ?? 0, 0), 1)
+        let percent = "\(Int((value * 100).rounded()))%"
+        if status.phase == .downloading {
+            let remainingTimeText = status.remainingTimeText ?? "正在估算"
+            return "\(percent)  (\(remainingTimeText))"
+        }
+        return percent
+    }
+}
+
+private struct ModelProfileOptionView: View {
+    let profile: ModelResourceProfile
+    let isSelected: Bool
+    let isEnabled: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: {
+            guard isEnabled else {
+                return
+            }
+            onSelect()
+        }) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(profile.displayName)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.blue)
+                    }
+                }
+
+                Text(profile.shortDescription)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Text(profile.estimatedDownloadText)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                if !isEnabled {
+                    Text("需要 16GB 及以上内存")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 11)
+            .padding(.horizontal, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? Color.blue.opacity(0.08) : Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(isSelected ? Color.blue.opacity(0.45) : Color(nsColor: .separatorColor), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .opacity(isEnabled ? 1 : 0.48)
+        .disabled(!isEnabled)
+    }
+}
+
+private struct AlignmentOptionRow: View {
+    let isEnabled: Bool
+    let isInteractive: Bool
+    let onChange: (Bool) -> Void
+
+    var body: some View {
+        Toggle(isOn: Binding(
+            get: { isEnabled },
+            set: { onChange($0) }
+        )) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("字幕时间戳对齐")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Text("推荐开启，播放和字幕定位更准确。关闭后下载更少，速度更快。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
+        .disabled(!isInteractive)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        }
+    }
+}
+
+struct ResourceSettingsView: View {
+    @ObservedObject var model: AuralAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var draftProfile: ModelResourceProfile
+    @State private var draftAlignmentEnabled: Bool
+
+    init(model: AuralAppModel) {
+        self.model = model
+        _draftProfile = State(initialValue: model.selectedModelProfile)
+        _draftAlignmentEnabled = State(initialValue: model.selectedAlignmentEnabled)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Text("本地转写设置")
+                    .font(.system(size: 20, weight: .semibold))
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("默认模型")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    ForEach(ModelResourceProfile.allCases, id: \.self) { profile in
+                        ModelProfileOptionView(
+                            profile: profile,
+                            isSelected: profile == draftProfile,
+                            isEnabled: profile.isAvailable(),
+                            onSelect: { draftProfile = profile }
+                        )
+                    }
+                }
+            }
+
+            AlignmentOptionRow(
+                isEnabled: draftAlignmentEnabled,
+                isInteractive: true,
+                onChange: { draftAlignmentEnabled = $0 }
+            )
+
+            HStack {
+                Text("缺失的资源会在准备时下载，已下载资源会保留并复用。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("取消") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("保存并准备") {
+                    apply(prepareIfNeeded: true)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 660)
+    }
+
+    private func apply(prepareIfNeeded: Bool) {
+        model.applyResourceConfiguration(
+            profile: draftProfile,
+            alignmentEnabled: draftAlignmentEnabled,
+            prepareIfNeeded: prepareIfNeeded
+        )
     }
 }
 
@@ -726,7 +1383,23 @@ struct TaskListPane: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                TaskSearchField(text: $searchText)
+                HStack(spacing: 8) {
+                    TaskSearchField(text: $searchText)
+                    Button(action: { model.isShowingSettings = true }) {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 34, height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.82))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
+                    }
+                    .help("本地转写设置")
+                }
                     .padding(.horizontal, 24)
                     .padding(.bottom, 14)
 
@@ -797,12 +1470,12 @@ struct TaskListPane: View {
             if model.isSelecting {
                 SelectionActionBar(
                     count: model.selectedTaskIDs.count,
-                    canPause: model.canPauseSelectedTasks,
-                    canResume: model.canResumeSelectedTasks,
+                    canStop: model.canStopSelectedTasks,
+                    canStart: model.canStartSelectedTasks,
                     canExport: model.canExportSelectedTasks,
                     canDelete: model.canDeleteSelectedTasks,
-                    onPause: model.pauseSelectedTasks,
-                    onResume: model.resumeSelectedTasks,
+                    onStop: model.stopSelectedTasks,
+                    onStart: model.startSelectedTasks,
                     onExport: { format in
                         model.exportSelectedTranscripts(format: format)
                     },
@@ -1189,7 +1862,8 @@ private struct RenameCommitTextField: NSViewRepresentable {
         context.coordinator.text = $text
         context.coordinator.onCommit = onCommit
         context.coordinator.onCancel = onCancel
-        if field.stringValue != text {
+        let isComposingMarkedText = (field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
+        if !context.coordinator.isEditing, !isComposingMarkedText, field.stringValue != text {
             field.stringValue = text
         }
         if field.font != font {
@@ -1202,11 +1876,16 @@ private struct RenameCommitTextField: NSViewRepresentable {
         var onCommit: () -> Void
         var onCancel: () -> Void
         private var didCancel = false
+        var isEditing = false
 
         init(text: Binding<String>, onCommit: @escaping () -> Void, onCancel: @escaping () -> Void) {
             self.text = text
             self.onCommit = onCommit
             self.onCancel = onCancel
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            isEditing = true
         }
 
         func controlTextDidChange(_ notification: Notification) {
@@ -1217,6 +1896,7 @@ private struct RenameCommitTextField: NSViewRepresentable {
         }
 
         func controlTextDidEndEditing(_ notification: Notification) {
+            isEditing = false
             if didCancel {
                 didCancel = false
                 return
@@ -1288,12 +1968,12 @@ struct SelectionCheckbox: View {
 
 struct SelectionActionBar: View {
     let count: Int
-    let canPause: Bool
-    let canResume: Bool
+    let canStop: Bool
+    let canStart: Bool
     let canExport: Bool
     let canDelete: Bool
-    let onPause: () -> Void
-    let onResume: () -> Void
+    let onStop: () -> Void
+    let onStart: () -> Void
     let onExport: (TranscriptExportFormat) -> Void
     let onDelete: () -> Void
     let onCancel: () -> Void
@@ -1303,20 +1983,20 @@ struct SelectionActionBar: View {
             Text("已选择 \(count) 项")
                 .font(.system(size: 14, weight: .semibold))
             Spacer()
-            if canPause {
+            if canStop {
                 SelectionActionButton(
-                    title: "暂停",
-                    systemImage: "pause.fill",
+                    title: "停止",
+                    systemImage: "stop.fill",
                     tint: .orange,
-                    action: onPause
+                    action: onStop
                 )
             }
-            if canResume {
+            if canStart {
                 SelectionActionButton(
-                    title: "继续",
+                    title: "开始",
                     systemImage: "play.fill",
                     tint: .blue,
-                    action: onResume
+                    action: onStart
                 )
             }
             if canExport {
@@ -1497,12 +2177,7 @@ struct TaskDetailPane: View {
     let statusText: String?
     let onChooseFiles: () -> Void
     let onRename: (TranscriptionTask, String) -> Void
-    @State private var playbackTime: TimeInterval = 0
-    @State private var isPlaybackActive = false
-    @State private var transcriptFocus: TranscriptFocus?
     @State private var isTitleHovered = false
-    @State private var selectedDetailTab: TaskDetailTab = .transcript
-    @State private var playbackSeekRequest: PlaybackSeekRequest?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -1526,29 +2201,7 @@ struct TaskDetailPane: View {
 
                 Divider()
 
-                AudioPlayerShell(
-                    task: task,
-                    seekRequest: playbackSeekRequest,
-                    onPlaybackTimeChange: { playbackTime = $0 },
-                    onPlaybackStateChange: { isPlaybackActive = $0 },
-                    onSeekCommitted: { transcriptFocus = TranscriptFocus(time: $0) }
-                )
-
-                VStack(alignment: .leading, spacing: 14) {
-                    TaskDetailTabBar(selectedTab: $selectedDetailTab)
-
-                    switch selectedDetailTab {
-                    case .transcript:
-                        TranscriptPreview(
-                            task: task,
-                            currentTime: playbackTime,
-                            isPlaybackActive: isPlaybackActive,
-                            focus: transcriptFocus,
-                            onSeekToTime: seekToTranscriptTime
-                        )
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                TaskPlaybackTranscriptSection(task: task)
             } else {
                 Spacer()
                 AuralEmptyDetailView(onChooseFiles: onChooseFiles)
@@ -1557,6 +2210,48 @@ struct TaskDetailPane: View {
             }
         }
         .padding(32)
+    }
+}
+
+private struct TaskPlaybackTranscriptSection: View {
+    let task: TranscriptionTask
+    @State private var playbackTime: TimeInterval = 0
+    @State private var isPlaybackActive = false
+    @State private var transcriptFocus: TranscriptFocus?
+    @State private var selectedDetailTab: TaskDetailTab = .transcript
+    @State private var playbackSeekRequest: PlaybackSeekRequest?
+
+    var body: some View {
+        AudioPlayerShell(
+            task: task,
+            seekRequest: playbackSeekRequest,
+            onPlaybackTimeChange: { playbackTime = $0 },
+            onPlaybackStateChange: { isPlaybackActive = $0 },
+            onSeekCommitted: { transcriptFocus = TranscriptFocus(time: $0) }
+        )
+
+        VStack(alignment: .leading, spacing: 14) {
+            TaskDetailTabBar(selectedTab: $selectedDetailTab)
+
+            switch selectedDetailTab {
+            case .transcript:
+                TranscriptPreview(
+                    task: task,
+                    currentTime: playbackTime,
+                    isPlaybackActive: isPlaybackActive,
+                    focus: transcriptFocus,
+                    onSeekToTime: seekToTranscriptTime
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .onChange(of: task.id) {
+            playbackTime = 0
+            isPlaybackActive = false
+            transcriptFocus = nil
+            playbackSeekRequest = nil
+            selectedDetailTab = .transcript
+        }
     }
 
     private func seekToTranscriptTime(_ time: TimeInterval) {
@@ -1778,9 +2473,9 @@ private enum PlaybackSkipDirection {
     var systemImage: String {
         switch self {
         case .backward:
-            "gobackward"
+            "gobackward.15"
         case .forward:
-            "goforward"
+            "goforward.15"
         }
     }
 
@@ -1801,21 +2496,13 @@ private struct PlaybackSkipButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: direction.systemImage)
-                .font(.system(size: 16, weight: .semibold))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(Color.primary.opacity(0.76))
+                .font(.system(size: 19, weight: .medium))
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(Color.primary.opacity(0.82))
                 .frame(width: 30, height: 30)
-                .background(
-                    Circle()
-                        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.86))
-                )
-                .overlay {
-                    Circle()
-                        .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
-                }
         }
         .buttonStyle(.plain)
-        .contentShape(Circle())
+        .contentShape(Rectangle())
         .help(direction.help)
         .accessibilityLabel(direction.help)
     }
@@ -1931,9 +2618,19 @@ final class AudioPlaybackViewModel: ObservableObject {
     }
 
     private func refresh() {
-        currentTime = controller.currentTime
-        duration = controller.duration > 0 ? controller.duration : duration
-        isPlaying = controller.isPlaying
+        let nextCurrentTime = controller.currentTime
+        let nextDuration = controller.duration > 0 ? controller.duration : duration
+        let nextIsPlaying = controller.isPlaying
+
+        if abs(currentTime - nextCurrentTime) > 0.02 {
+            currentTime = nextCurrentTime
+        }
+        if abs(duration - nextDuration) > 0.02 {
+            duration = nextDuration
+        }
+        if isPlaying != nextIsPlaying {
+            isPlaying = nextIsPlaying
+        }
     }
 }
 
@@ -2082,6 +2779,10 @@ struct TranscriptPreview: View {
     let isPlaybackActive: Bool
     let focus: TranscriptFocus?
     let onSeekToTime: (TimeInterval) -> Void
+    @State private var cachedBundle: TranscriptDisplayBundle?
+    @State private var cachedTaskID: UUID?
+    @State private var cachedTranscriptPath: String?
+    @State private var transcriptLoadAttempted = false
     @State private var flashSegmentIndex: Int?
     @State private var flashPulse = false
     @State private var flashToken = UUID()
@@ -2090,20 +2791,23 @@ struct TranscriptPreview: View {
     @State private var showFollowPlaybackButton = false
 
     var body: some View {
-        if task.status == .done {
-            if let bundle = loadTranscriptBundle() {
+        Group {
+            if task.status == .done {
+            if let bundle = currentTranscriptBundle {
                 let transcript = bundle.transcript
                 let alignmentItems = bundle.alignment?.items ?? []
+                let activeIndex = segmentIndex(for: currentTime, in: transcript.segments)
                 ScrollViewReader { proxy in
                     ZStack(alignment: .bottom) {
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 14) {
                                 ForEach(Array(transcript.segments.enumerated()), id: \.offset) { index, segment in
+                                    let isActiveSegment = activeIndex == index
                                     TranscriptLine(
                                         segment: segment,
-                                        currentTime: currentTime,
+                                        currentTime: isActiveSegment ? currentTime : segment.startSec,
                                         alignmentItems: alignmentItems,
-                                        isActive: segmentIndex(for: currentTime, in: transcript.segments) == index,
+                                        isActive: isActiveSegment,
                                         isFocused: flashSegmentIndex == index,
                                         highlightPulse: flashPulse,
                                         onDoubleClickAtTextOffset: { offset in
@@ -2131,7 +2835,7 @@ struct TranscriptPreview: View {
 
                         if isPlaybackActive,
                            showFollowPlaybackButton,
-                           segmentIndex(for: currentTime, in: transcript.segments) != nil {
+                           activeIndex != nil {
                             FollowPlaybackButton {
                                 restorePlaybackFollow(proxy: proxy, transcript: transcript)
                             }
@@ -2166,24 +2870,78 @@ struct TranscriptPreview: View {
                     }
                     .animation(.easeInOut(duration: 0.18), value: showFollowPlaybackButton)
                 }
+            } else if transcriptLoadAttempted {
+                Text("转写结果读取失败")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.secondary)
             } else {
-                Text("转写完成")
+                Text("读取转写结果")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
-        } else if task.status == .failed {
-            Text("转写失败")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.secondary)
-        } else if task.status == .paused {
-            Text("已暂停")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.secondary)
-        } else {
-            Text("开始后生成内容")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.secondary)
+            } else if task.status == .failed {
+                Text("转写失败")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            } else if task.status == .paused {
+                Text("已停止")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("开始后生成内容")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
         }
+        .onAppear(perform: refreshTranscriptBundleIfNeeded)
+        .onChange(of: task.id) {
+            invalidateTranscriptBundle()
+            refreshTranscriptBundleIfNeeded()
+        }
+        .onChange(of: task.transcriptPath) {
+            invalidateTranscriptBundle()
+            refreshTranscriptBundleIfNeeded()
+        }
+        .onChange(of: task.status) {
+            if task.status == .done {
+                refreshTranscriptBundleIfNeeded()
+            } else {
+                invalidateTranscriptBundle()
+            }
+        }
+    }
+
+    private var currentTranscriptBundle: TranscriptDisplayBundle? {
+        guard cachedTaskID == task.id,
+              cachedTranscriptPath == task.transcriptPath else {
+            return nil
+        }
+        return cachedBundle
+    }
+
+    private func refreshTranscriptBundleIfNeeded() {
+        guard task.status == .done else {
+            return
+        }
+        guard cachedTaskID != task.id || cachedTranscriptPath != task.transcriptPath || !transcriptLoadAttempted else {
+            return
+        }
+        cachedTaskID = task.id
+        cachedTranscriptPath = task.transcriptPath
+        cachedBundle = loadTranscriptBundle()
+        transcriptLoadAttempted = true
+    }
+
+    private func invalidateTranscriptBundle() {
+        cachedBundle = nil
+        cachedTaskID = nil
+        cachedTranscriptPath = nil
+        transcriptLoadAttempted = false
+        followedSegmentIndex = nil
+        flashSegmentIndex = nil
+        flashPulse = false
+        isFollowingPlayback = true
+        showFollowPlaybackButton = false
     }
 
     private func loadTranscriptBundle() -> TranscriptDisplayBundle? {
@@ -2268,6 +3026,9 @@ struct TranscriptPreview: View {
 
     private func pausePlaybackFollow(for transcript: Transcript) {
         guard segmentIndex(for: currentTime, in: transcript.segments) != nil else {
+            return
+        }
+        guard isFollowingPlayback || !showFollowPlaybackButton else {
             return
         }
         isFollowingPlayback = false

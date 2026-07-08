@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-user_path="/Users/"'limao'
+user_path="/"'Users/[^[:space:]]+'
 package_manager_path="/opt/"'homebrew'
 key_marker="BE"'GIN .*'"K"'EY'
-token_marker="TO"'KEN'
+token_marker="(API|ACCESS|AUTH|BEARER|REFRESH|HF|HUGGINGFACE_HUB|MODELSCOPE|GITHUB)[_-]?"'TOKEN'
 secret_marker="SEC"'RET'
 password_marker="PASS"'WORD'
 

@@ -18,8 +18,38 @@ from itn_postprocess import apply_itn_to_transcript
 
 
 RESOURCES_ROOT = Path(__file__).resolve().parents[1]
-MODEL_ROOT = RESOURCES_ROOT / "asr-models" / "qwen3-asr-1.7b-4bit"
 AFCONVERT = Path("/usr/bin/afconvert")
+# Qwen3-ASR can fall into stable repetition loops on some ~40s+ long-form speech chunks.
+# Keep the model's internal decode window short; the outer worker still owns file-level chunking.
+ASR_GENERATE_CHUNK_DURATION_SEC = 30.0
+ASR_GENERATE_MAX_TOKENS = 8192
+ASR_GENERATE_REPETITION_PENALTY = 1.10
+ASR_GENERATE_REPETITION_CONTEXT_SIZE = 32
+OUTER_CHUNK_TARGET_SEC = 60.0
+OUTER_CHUNK_MAX_SEC = 90.0
+OUTER_CHUNK_MIN_SEC = 10.0
+ASR_MODEL_DIRECTORIES = {
+    "fast": "qwen3-asr-0.6b-4bit",
+    "balanced": "qwen3-asr-1.7b-4bit",
+    "accurate": "qwen3-asr-1.7b-bf16",
+}
+
+
+def resolve_asr_model_root():
+    override = os.environ.get("AURAL_ASR_MODEL")
+    if override:
+        return Path(override).expanduser()
+    profile = os.environ.get("AURAL_MODEL_PROFILE", "balanced")
+    directory = ASR_MODEL_DIRECTORIES.get(profile, ASR_MODEL_DIRECTORIES["balanced"])
+    model_root = os.environ.get("AURAL_MODEL_ROOT")
+    if model_root:
+        return Path(model_root).expanduser() / directory
+    return RESOURCES_ROOT / "asr-models" / directory
+
+
+def alignment_enabled():
+    value = os.environ.get("AURAL_ALIGNMENT_ENABLED", "1").lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def emit(event):
@@ -99,6 +129,44 @@ def clean_asr_template_artifacts(text):
     return clean.strip()
 
 
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    if value.strip().lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return float(value)
+
+
+def env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    if value.strip().lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return int(value)
+
+
+def default_repetition_penalty():
+    profile = os.environ.get("AURAL_MODEL_PROFILE", "balanced")
+    if profile == "accurate":
+        return None
+    return ASR_GENERATE_REPETITION_PENALTY
+
+
+def asr_generate_settings():
+    penalty = env_float("AURAL_ASR_REPETITION_PENALTY", default_repetition_penalty())
+    context_size = env_int("AURAL_ASR_REPETITION_CONTEXT_SIZE", ASR_GENERATE_REPETITION_CONTEXT_SIZE)
+    if penalty is None:
+        context_size = None
+    return {
+        "chunk_duration_sec": ASR_GENERATE_CHUNK_DURATION_SEC,
+        "max_tokens": ASR_GENERATE_MAX_TOKENS,
+        "repetition_penalty": penalty,
+        "repetition_context_size": context_size,
+    }
+
+
 def repeat_key(text):
     return re.sub(r"[\s,.;:!?，。；：！？、\"'（）()]+", "", str(text or "")).lower()
 
@@ -137,7 +205,14 @@ def collapse_repeated_sentences(text, min_run=4, keep=1):
 
 def generate_one(model, audio_path, language, system_prompt=None):
     signature = inspect.signature(model.generate)
-    kwargs = {"max_tokens": 8192, "verbose": False}
+    settings = asr_generate_settings()
+    kwargs = {"max_tokens": settings["max_tokens"], "verbose": False}
+    if "chunk_duration" in signature.parameters:
+        kwargs["chunk_duration"] = settings["chunk_duration_sec"]
+    if settings["repetition_penalty"] is not None and "repetition_penalty" in signature.parameters:
+        kwargs["repetition_penalty"] = settings["repetition_penalty"]
+    if settings["repetition_context_size"] is not None and "repetition_context_size" in signature.parameters:
+        kwargs["repetition_context_size"] = settings["repetition_context_size"]
     if "language" in signature.parameters:
         kwargs["language"] = language
     if "source_lang" in signature.parameters:
@@ -377,7 +452,13 @@ def choose_cut(start, duration, silence_midpoints, target_sec, max_sec, min_sec)
     return target if lower <= target <= upper else upper
 
 
-def build_audio_segments(samples, sample_rate, target_sec=120.0, max_sec=180.0, min_sec=20.0):
+def build_audio_segments(
+    samples,
+    sample_rate,
+    target_sec=OUTER_CHUNK_TARGET_SEC,
+    max_sec=OUTER_CHUNK_MAX_SEC,
+    min_sec=OUTER_CHUNK_MIN_SEC,
+):
     duration = len(samples) / sample_rate if sample_rate else 0.0
     if duration <= 0:
         return [], duration
@@ -536,8 +617,9 @@ def transcribe(request):
         audio_path = Path(request["audio_path"]).expanduser()
         if not audio_path.exists():
             raise RuntimeError(f"audio file not found: {audio_path}")
-        if not MODEL_ROOT.exists():
-            raise RuntimeError(f"bundled model not found: {MODEL_ROOT}")
+        model_root = resolve_asr_model_root()
+        if not model_root.exists():
+            raise RuntimeError(f"local ASR model not found: {model_root}")
 
         emit(
             {
@@ -576,10 +658,11 @@ def transcribe(request):
         from mlx_audio.stt import load
 
         started_load = time.time()
-        model = load(str(MODEL_ROOT))
+        model = load(str(model_root))
         load_sec = time.time() - started_load
         language = normalize_language(request.get("language") or "auto")
         system_prompt = None
+        generate_settings = asr_generate_settings()
 
         transcript_segments = []
         chunk_records = []
@@ -672,27 +755,38 @@ def transcribe(request):
                 }
             )
 
-        try:
-            alignment_result = refine_segments_with_alignment(
-                chunk_records,
-                output_dir,
-                language=language,
-                progress_callback=emit_alignment_progress,
-            )
-            alignment_metadata = alignment_result.get("metadata")
-            if alignment_result.get("timestamp_method"):
-                timestamp_method = alignment_result["timestamp_method"]
-                transcript_segments = alignment_result.get("segments") or transcript_segments
-        except Exception as exc:
+        if alignment_enabled():
+            try:
+                alignment_result = refine_segments_with_alignment(
+                    chunk_records,
+                    output_dir,
+                    language=language,
+                    progress_callback=emit_alignment_progress,
+                )
+                alignment_metadata = alignment_result.get("metadata")
+                if alignment_result.get("timestamp_method"):
+                    timestamp_method = alignment_result["timestamp_method"]
+                    transcript_segments = alignment_result.get("segments") or transcript_segments
+            except Exception as exc:
+                alignment_metadata = {
+                    "enabled": True,
+                    "engine": "qwen3_forced_aligner",
+                    "runtime": "mlx_audio",
+                    "status": "error_fallback_estimated",
+                    "chunk_count": len(chunk_records),
+                    "aligned_chunk_count": 0,
+                    "failed_chunk_count": len(chunk_records),
+                    "error": repr(exc)[:500],
+                }
+        else:
             alignment_metadata = {
-                "enabled": True,
+                "enabled": False,
                 "engine": "qwen3_forced_aligner",
                 "runtime": "mlx_audio",
-                "status": "error_fallback_estimated",
+                "status": "disabled",
                 "chunk_count": len(chunk_records),
                 "aligned_chunk_count": 0,
-                "failed_chunk_count": len(chunk_records),
-                "error": repr(exc)[:500],
+                "failed_chunk_count": 0,
             }
 
         transcript = {
@@ -707,6 +801,17 @@ def transcribe(request):
                 "fallback_timestamp_method": fallback_timestamp_method,
                 "segment_count": len(audio_segments),
                 "load_sec": load_sec,
+                "asr_generate": {
+                    "chunk_duration_sec": generate_settings["chunk_duration_sec"],
+                    "max_tokens": generate_settings["max_tokens"],
+                    "repetition_penalty": generate_settings["repetition_penalty"],
+                    "repetition_context_size": generate_settings["repetition_context_size"],
+                },
+                "audio_chunking": {
+                    "target_sec": OUTER_CHUNK_TARGET_SEC,
+                    "max_sec": OUTER_CHUNK_MAX_SEC,
+                    "min_sec": OUTER_CHUNK_MIN_SEC,
+                },
                 "alignment": alignment_metadata,
                 "vad": {
                     "engine": "rms_dynamic_threshold",

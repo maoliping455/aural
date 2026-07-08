@@ -20,6 +20,77 @@ let audioRoot = validationRoot.appendingPathComponent("input", isDirectory: true
 let dataRoot = validationRoot.appendingPathComponent("data", isDirectory: true)
 let workerURL = packageRoot.appendingPathComponent("AuralASRWorker/worker_stub.py")
 let fileManager = FileManager.default
+let validationWorkerEnvironment = ["PYTHONDONTWRITEBYTECODE": "1"]
+
+func validationWorkerClient(
+    workerURL: URL,
+    timeoutSeconds: TimeInterval? = ASRWorkerClient.defaultTimeoutSeconds
+) -> ASRWorkerClient {
+    ASRWorkerClient(
+        workerURL: workerURL,
+        timeoutSeconds: timeoutSeconds,
+        environment: validationWorkerEnvironment
+    )
+}
+
+let oldMacOSStatus = RuntimeCompatibility.blockingStatus(
+    currentVersion: OperatingSystemVersion(majorVersion: 13, minorVersion: 6, patchVersion: 0),
+    isAppleSilicon: true
+)
+require(oldMacOSStatus?.allowsRetry == false, "macOS 13 should be blocked before model download")
+let intelStatus = RuntimeCompatibility.blockingStatus(
+    currentVersion: OperatingSystemVersion(majorVersion: 14, minorVersion: 0, patchVersion: 0),
+    isAppleSilicon: false
+)
+require(intelStatus?.allowsRetry == false, "Intel Mac should be blocked before model download")
+require(ModelResourceStatus.needsDownload.phase == .needsDownload, "missing models should be represented as a user-started download gate")
+require(
+    ModelResourceStatus.needsDownload(profile: .accurate, allowsProfileSelection: true).detail.contains("选择"),
+    "high-memory first launch should describe local model mode selection"
+)
+require(
+    ModelResourceConfiguration.default.profile == .balanced
+        && ModelResourceConfiguration.default.alignmentEnabled,
+    "default model resources should be balanced with alignment enabled"
+)
+require(
+    ModelResourceProfile.fast.asrDirectoryName == "qwen3-asr-0.6b-4bit",
+    "fast profile should use the 0.6B 4bit ASR model"
+)
+require(
+    ModelResourceProfile.fast.isAvailable(
+        physicalMemoryBytes: ModelResourceProfile.accurateMinimumMemoryBytes - 1
+    ),
+    "fast profile should be available below the accurate memory threshold"
+)
+require(
+    RuntimeCompatibility.effectiveProfile(
+        .accurate,
+        physicalMemoryBytes: ModelResourceProfile.accurateMinimumMemoryBytes - 1
+    ) == .balanced,
+    "accurate profile should fall back to balanced below the memory threshold"
+)
+require(
+    RuntimeCompatibility.effectiveProfile(
+        .accurate,
+        physicalMemoryBytes: ModelResourceProfile.accurateMinimumMemoryBytes
+    ) == .accurate,
+    "accurate profile should be available at the memory threshold"
+)
+let resourceEventDecoder = JSONDecoder()
+resourceEventDecoder.keyDecodingStrategy = .convertFromSnakeCase
+let progressEvent = try resourceEventDecoder.decode(
+    ModelResourceEvent.self,
+    from: Data(#"{"type":"download_progress","profile":"accurate","downloaded_bytes":123,"total_bytes":456,"progress":0.27}"#.utf8)
+)
+require(abs((progressEvent.progress ?? 0) - 0.27) < 0.0001, "model download progress events should decode")
+require(progressEvent.downloadedBytes == 123, "model download progress should include downloaded bytes")
+require(progressEvent.totalBytes == 456, "model download progress should include total bytes")
+let supportedMacOSStatus = RuntimeCompatibility.blockingStatus(
+    currentVersion: OperatingSystemVersion(majorVersion: 14, minorVersion: 0, patchVersion: 0),
+    isAppleSilicon: true
+)
+require(supportedMacOSStatus == nil, "Apple Silicon macOS 14 should pass compatibility gate")
 
 if fileManager.fileExists(atPath: validationRoot.path) {
     try fileManager.removeItem(at: validationRoot)
@@ -142,7 +213,7 @@ require(tasksAfterDelete.isEmpty, "delete task should remove task record")
 
 let queue = TranscriptionQueue(
     store: store,
-    workerClient: ASRWorkerClient(workerURL: workerURL)
+    workerClient: validationWorkerClient(workerURL: workerURL)
 )
 
 let processed = try queue.drainPendingTasks()
@@ -161,6 +232,17 @@ require(failResult?.status == .failed, "failure task should be failed")
 require(failResult?.errorLogPath != nil, "failure task should have error log path")
 require(failResult?.progressFraction == nil, "failure task should clear progress after failure")
 
+try Data("aural validation retry ok".utf8).write(to: URL(fileURLWithPath: failResult!.localAudioPath))
+let restartedFailedTasks = try store.startTasks(ids: [failTask.id])
+require(restartedFailedTasks.count == 1, "failed task should be restartable")
+let restartedFailedTask = try store.load().first { $0.id == failTask.id }
+require(restartedFailedTask?.status == .pending, "restarted failed task should return to pending")
+require(restartedFailedTask?.errorLogPath == nil, "restarted failed task should clear error log path")
+_ = try queue.drainPendingTasks()
+let retriedFailedTask = try store.load().first { $0.id == failTask.id }
+require(retriedFailedTask?.status == .done, "restarted failed task should be processed again")
+require(retriedFailedTask?.transcriptPath != nil, "restarted failed task should write transcript")
+
 let completedTask = okResult!
 let transcriptURL = URL(fileURLWithPath: completedTask.transcriptPath!)
 require(fileManager.fileExists(atPath: transcriptURL.path), "transcript file should exist")
@@ -171,6 +253,127 @@ require(transcript.segments[0].startSec == 0.0, "first transcript segment should
 require(transcript.rawText?.isEmpty == false, "transcript should preserve raw text")
 require(transcript.normalizedText == transcript.text, "normalized transcript text should match displayed text")
 require(transcript.segments[0].rawText?.isEmpty == false, "transcript segment should preserve raw text")
+
+let invalidCompletionStore = TaskStore(
+    rootURL: validationRoot.appendingPathComponent("invalid-completion-data", isDirectory: true)
+)
+try invalidCompletionStore.bootstrap()
+let invalidCompletionAudio = audioRoot.appendingPathComponent("invalid-completion.m4a")
+try Data("aural validation invalid completion".utf8).write(to: invalidCompletionAudio)
+let invalidCompletionTask = try invalidCompletionStore.createTask(fromAudioURL: invalidCompletionAudio)
+let invalidCompletionWorkerURL = validationRoot.appendingPathComponent("invalid_completion_worker.py")
+try Data(
+    """
+    import json
+    import sys
+
+    request = json.loads(sys.stdin.readline())
+    print(json.dumps({
+        "type": "completed",
+        "request_id": request["request_id"],
+        "task_id": request["task_id"],
+        "transcript_path": request["output_dir"] + "/missing-transcript.json",
+        "duration_sec": 1
+    }), flush=True)
+    """.utf8
+).write(to: invalidCompletionWorkerURL)
+let invalidCompletionQueue = TranscriptionQueue(
+    store: invalidCompletionStore,
+    workerClient: validationWorkerClient(workerURL: invalidCompletionWorkerURL)
+)
+_ = try invalidCompletionQueue.drainPendingTasks()
+let invalidCompletionResult = try invalidCompletionStore.load().first { $0.id == invalidCompletionTask.id }
+require(
+    invalidCompletionResult?.status == .failed,
+    "completed worker event with missing transcript should be treated as failed"
+)
+require(
+    invalidCompletionResult?.transcriptPath == nil,
+    "invalid completed transcript should not be stored on task"
+)
+require(
+    invalidCompletionResult?.errorLogPath != nil,
+    "invalid completed transcript should preserve an error log"
+)
+
+let fractionalTranscriptURL = validationRoot.appendingPathComponent("fractional-created-at-transcript.json")
+let fractionalTranscriptTaskId = UUID()
+try Data(
+    """
+    {
+      "task_id": "\(fractionalTranscriptTaskId.uuidString)",
+      "audio_duration_sec": 1.0,
+      "created_at": "2026-07-07T10:01:12.806505+00:00",
+      "segments": [
+        {
+          "start_sec": 0.0,
+          "end_sec": 1.0,
+          "text": "微秒时间"
+        }
+      ],
+      "text": "微秒时间"
+    }
+    """.utf8
+).write(to: fractionalTranscriptURL)
+let fractionalTranscript = try TranscriptStore.load(from: fractionalTranscriptURL)
+require(
+    fractionalTranscript.taskId == fractionalTranscriptTaskId,
+    "transcript store should decode Python ISO8601 dates with fractional seconds"
+)
+
+let repairInvalidDoneStore = TaskStore(
+    rootURL: validationRoot.appendingPathComponent("repair-invalid-done-data", isDirectory: true)
+)
+try repairInvalidDoneStore.bootstrap()
+let repairInvalidDoneAudio = audioRoot.appendingPathComponent("repair-invalid-done.m4a")
+try Data("aural validation repair invalid done".utf8).write(to: repairInvalidDoneAudio)
+var repairInvalidDoneTask = try repairInvalidDoneStore.createTask(fromAudioURL: repairInvalidDoneAudio)
+repairInvalidDoneTask.status = .done
+repairInvalidDoneTask.completedAt = Date()
+repairInvalidDoneTask.transcriptPath = repairInvalidDoneStore
+    .taskDirectoryURL(for: repairInvalidDoneTask.id)
+    .appendingPathComponent("missing-transcript.json")
+    .path
+try repairInvalidDoneStore.update(repairInvalidDoneTask)
+let repairedInvalidDoneTasks = try repairInvalidDoneStore.repairInvalidCompletedTasks()
+require(repairedInvalidDoneTasks.count == 1, "repair should find invalid completed task")
+let repairedInvalidDoneTask = try repairInvalidDoneStore.load().first { $0.id == repairInvalidDoneTask.id }
+require(repairedInvalidDoneTask?.status == .failed, "invalid completed task should be repaired to failed")
+require(repairedInvalidDoneTask?.transcriptPath == nil, "repaired invalid completed task should clear transcript path")
+require(repairedInvalidDoneTask?.errorLogPath != nil, "repaired invalid completed task should write an error log")
+
+let repairFalseFailedStore = TaskStore(
+    rootURL: validationRoot.appendingPathComponent("repair-false-failed-data", isDirectory: true)
+)
+try repairFalseFailedStore.bootstrap()
+let repairFalseFailedAudio = audioRoot.appendingPathComponent("repair-false-failed.m4a")
+try Data("aural validation repair false failed".utf8).write(to: repairFalseFailedAudio)
+var repairFalseFailedTask = try repairFalseFailedStore.createTask(fromAudioURL: repairFalseFailedAudio)
+repairFalseFailedTask.status = .failed
+repairFalseFailedTask.failedAt = Date()
+repairFalseFailedTask.errorLogPath = repairFalseFailedStore
+    .taskDirectoryURL(for: repairFalseFailedTask.id)
+    .appendingPathComponent("error.log")
+    .path
+try repairFalseFailedStore.update(repairFalseFailedTask)
+try TranscriptStore.save(
+    Transcript(
+        taskId: repairFalseFailedTask.id,
+        audioDurationSec: 1,
+        createdAt: Date(timeIntervalSince1970: 0),
+        segments: [TranscriptSegment(startSec: 0, endSec: 1, text: "repair false failed")],
+        text: "repair false failed"
+    ),
+    to: repairFalseFailedStore
+        .taskDirectoryURL(for: repairFalseFailedTask.id)
+        .appendingPathComponent("transcript.json")
+)
+let repairedFalseFailedTasks = try repairFalseFailedStore.repairFailedTasksWithValidTranscript()
+require(repairedFalseFailedTasks.count == 1, "repair should restore failed task when transcript is valid")
+let repairedFalseFailedTask = try repairFalseFailedStore.load().first { $0.id == repairFalseFailedTask.id }
+require(repairedFalseFailedTask?.status == .done, "failed task with valid transcript should be restored to done")
+require(repairedFalseFailedTask?.transcriptPath?.hasSuffix("transcript.json") == true, "restored task should point to transcript")
+require(repairedFalseFailedTask?.errorLogPath == nil, "restored task should clear stale error log path")
 
 let metadataTranscript = Transcript(
     taskId: UUID(),
@@ -480,7 +683,7 @@ require(loadedAlignment?.items.first?.text == "你", "transcript store should lo
 
 require(TranscriptionStatus.pending.displayName == "未开始", "pending display name")
 require(TranscriptionStatus.running.displayName == "转写中", "running display name")
-require(TranscriptionStatus.paused.displayName == "已暂停", "paused display name")
+require(TranscriptionStatus.paused.displayName == "已停止", "paused display name")
 require(TranscriptionStatus.done.displayName == "转写完成", "done display name")
 require(TranscriptionStatus.failed.displayName == "转写失败", "failed display name")
 
@@ -497,7 +700,7 @@ let tasksAfterPause = try pauseStore.load()
 require(tasksAfterPause.first(where: { $0.id == pausedTask.id })?.status == .paused, "pause should mark task paused")
 let pauseQueue = TranscriptionQueue(
     store: pauseStore,
-    workerClient: ASRWorkerClient(workerURL: workerURL)
+    workerClient: validationWorkerClient(workerURL: workerURL)
 )
 _ = try pauseQueue.drainPendingTasks()
 let tasksAfterPauseDrain = try pauseStore.load()
@@ -559,7 +762,7 @@ try recoverQueueStore.update(recoverQueueTask)
 _ = try recoverQueueStore.recoverInterruptedTasks()
 let recoverQueue = TranscriptionQueue(
     store: recoverQueueStore,
-    workerClient: ASRWorkerClient(workerURL: workerURL)
+    workerClient: validationWorkerClient(workerURL: workerURL)
 )
 _ = try recoverQueue.drainPendingTasks()
 let recoverQueueTasks = try recoverQueueStore.load()
@@ -590,7 +793,7 @@ try crashStore.bootstrap()
 let crashTask = try crashStore.createTask(fromAudioURL: crashAudio)
 let crashQueue = TranscriptionQueue(
     store: crashStore,
-    workerClient: ASRWorkerClient(workerURL: crashWorker)
+    workerClient: validationWorkerClient(workerURL: crashWorker)
 )
 
 do {
@@ -640,7 +843,7 @@ try missingEventStore.bootstrap()
 let missingEventTask = try missingEventStore.createTask(fromAudioURL: missingEventAudio)
 let missingEventQueue = TranscriptionQueue(
     store: missingEventStore,
-    workerClient: ASRWorkerClient(workerURL: missingEventWorker)
+    workerClient: validationWorkerClient(workerURL: missingEventWorker)
 )
 
 do {
@@ -691,7 +894,7 @@ try timeoutStore.bootstrap()
 let timeoutTask = try timeoutStore.createTask(fromAudioURL: timeoutAudio)
 let timeoutQueue = TranscriptionQueue(
     store: timeoutStore,
-    workerClient: ASRWorkerClient(workerURL: timeoutWorker, timeoutSeconds: 0.2)
+    workerClient: validationWorkerClient(workerURL: timeoutWorker, timeoutSeconds: 0.2)
 )
 
 do {
@@ -740,7 +943,7 @@ try Data("valid enough for cancellation".utf8).write(to: cancelledAudio)
 let cancelledStore = TaskStore(rootURL: cancelledDataRoot)
 try cancelledStore.bootstrap()
 let cancelledTask = try cancelledStore.createTask(fromAudioURL: cancelledAudio)
-let cancelledClient = ASRWorkerClient(workerURL: cancelledWorker, timeoutSeconds: 5)
+let cancelledClient = validationWorkerClient(workerURL: cancelledWorker, timeoutSeconds: 5)
 
 do {
     _ = try cancelledClient.transcribe(

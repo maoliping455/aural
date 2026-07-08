@@ -10,6 +10,11 @@ VAD_WORKER="$APP_DIR/Contents/Resources/AuralASRWorker/worker_qwen_bundle.py"
 DIRECT_WORKER="$APP_DIR/Contents/Resources/AuralASRWorker/worker_qwen_direct_bundle.py"
 FFMPEG="$APP_DIR/Contents/Resources/runtime/bin/ffmpeg"
 ALIGNER_MODEL="$APP_DIR/Contents/Resources/aligner-models/qwen3-forcedaligner-0.6b-4bit-mlx"
+MODEL_ROOT="${AURAL_MODEL_ROOT:-$HOME/Library/Application Support/Aural/Models}"
+MODEL_PROFILE="${AURAL_MODEL_PROFILE:-balanced}"
+CACHED_ALIGNER_MODEL="$MODEL_ROOT/qwen3-forcedaligner-0.6b-4bit-mlx"
+export AURAL_MODEL_ROOT="$MODEL_ROOT"
+export AURAL_MODEL_PROFILE="$MODEL_PROFILE"
 
 if [[ -n "${AURAL_SMOKE_WORKER:-}" ]]; then
   WORKER="$AURAL_SMOKE_WORKER"
@@ -19,14 +24,17 @@ elif [[ "${AURAL_SMOKE_USE_VAD:-0}" == "1" && -x "$FFMPEG" && -f "$VAD_WORKER" ]
   EXPECTED_TIMESTAMP_METHOD="vad_chunked_segments"
 elif [[ "${AURAL_SMOKE_USE_DIRECT:-0}" != "1" && -f "$SEGMENTED_WORKER" ]]; then
   WORKER="$SEGMENTED_WORKER"
-  if [[ -d "$ALIGNER_MODEL" ]]; then
+  if [[ -d "$ALIGNER_MODEL" || -d "$CACHED_ALIGNER_MODEL" ]]; then
     EXPECTED_TIMESTAMP_METHOD="qwen3_forced_aligner_paragraph"
+    export AURAL_ALIGNMENT_ENABLED=1
   else
     EXPECTED_TIMESTAMP_METHOD="vad_speech_weighted_paragraph"
+    export AURAL_ALIGNMENT_ENABLED=0
   fi
 else
   WORKER="$DIRECT_WORKER"
   EXPECTED_TIMESTAMP_METHOD="text_length_proportional"
+  export AURAL_ALIGNMENT_ENABLED=0
 fi
 
 if [[ ! -x "$PYTHON" ]]; then

@@ -1,6 +1,15 @@
 # Local App Packaging
 
-The SwiftPM prototype can be packaged into a local unsigned/ad-hoc-signed macOS app bundle:
+Aural supports two packaging shapes:
+
+- **Lightweight release package**: app + local Python runtime, no ASR / aligner model weights. This is the default 0.1.0 release shape.
+- **Full offline package**: app + runtime + ASR model + aligner model. This is only for development or special offline distribution.
+
+The source repository never stores model weights, Python runtime directories, generated app bundles, DMGs, user media, or local transcripts.
+
+## Build A Development App
+
+Build a minimal app bundle without runtime or models:
 
 ```bash
 scripts/build-local-app.sh
@@ -12,7 +21,31 @@ Output:
 .build/release/Aural.app
 ```
 
-The default bundle includes:
+This shape is useful for Swift UI/core development. It can use explicit development worker settings, but it is not a user-facing release package.
+
+## Build The 0.1.0 Release Shape
+
+Build a lightweight release app with the bundled Python runtime but without model weights.
+Before packaging, pin the MLX runtime wheels to the release target platform. This is required even when building on a newer macOS, because pip may otherwise install wheels tagged for the build machine, such as `macosx_26_0_arm64`, which will not run on macOS 14/15:
+
+```bash
+scripts/pin-mlx-runtime-platform.sh /path/to/asr-python-venv macosx_14_0_arm64
+```
+
+Then build the app:
+
+```bash
+AURAL_RUNTIME_MIN_MACOS=14.0 \
+AURAL_CODESIGN_REQUIRE_DEVELOPER_ID=1 \
+AURAL_CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+scripts/build-local-app.sh \
+  --include-runtime \
+  --venv-source /path/to/asr-python-venv \
+  --python-base-source /path/to/cpython-3.12 \
+  --itn-fst-source /path/to/custom-wetext-fsts
+```
+
+The generated app contains:
 
 ```text
 Aural.app/
@@ -26,7 +59,9 @@ Aural.app/
         worker_qwen_direct_bundle.py
         worker_qwen_bundle.py
         worker_qwen_dev.py
+        model_resource_prepare.py
         itn_postprocess.py
+        alignment_postprocess.py
       itn/
         custom_wetext_fsts/
       runtime/
@@ -34,37 +69,63 @@ Aural.app/
       aligner-models/
 ```
 
-By default the script does not copy the 1.49 GiB model. To create a larger bundle with the local model copied into app resources:
+`asr-models/` and `aligner-models/` remain empty in the lightweight release. On app launch, Aural checks:
 
-```bash
-scripts/build-local-app.sh \
-  --include-model \
-  --model-source /path/to/qwen3-asr-1.7b-4bit \
-  --aligner-model-source /path/to/qwen3-forcedaligner-0.6b-4bit-mlx
+```text
+~/Library/Application Support/Aural/Models/qwen3-asr-0.6b-4bit
+~/Library/Application Support/Aural/Models/qwen3-asr-1.7b-4bit
+~/Library/Application Support/Aural/Models/qwen3-asr-1.7b-bf16
+~/Library/Application Support/Aural/Models/qwen3-forcedaligner-0.6b-4bit-mlx
 ```
 
-or:
+If the selected ASR model or enabled aligner model is missing or incomplete, the app shows a blocking model preparation screen and does not allow import/transcription until preparation succeeds. Users can choose among fast, balanced, and accurate ASR modes before the first download; balanced plus timestamp alignment is the default recommendation. Accurate mode requires at least 16 GB RAM. Timestamp alignment is an independent optional resource and can be enabled or disabled in the app's local transcription settings. The downloader tries ModelScope first and Hugging Face as fallback. Downloaded models live outside the app bundle so app upgrades can reuse them.
+
+The build script audits the packaged runtime after copying it into `Aural.app`. It fails if any Python wheel tag, Mach-O binary, or Metal library declares a minimum macOS version higher than `AURAL_RUNTIME_MIN_MACOS` (default `14.0`). Run the audit directly when investigating a bundle:
 
 ```bash
-AURAL_MODEL_SOURCE=/path/to/qwen3-asr-1.7b-4bit \
-AURAL_ALIGNER_MODEL_SOURCE=/path/to/qwen3-forcedaligner-0.6b-4bit-mlx \
-scripts/build-local-app.sh --include-model
+AURAL_RUNTIME_MIN_MACOS=14.0 scripts/audit-runtime-compatibility.sh .build/release/Aural.app
 ```
 
-To include the current local ASR runtime and bundled local models:
+Development overrides:
+
+```bash
+AURAL_MODEL_ROOT=/path/to/Aural/Models
+AURAL_MODELSCOPE_ASR_MODEL_FAST=mlx-community/Qwen3-ASR-0.6B-4bit
+AURAL_HF_ASR_MODEL_FAST=mlx-community/Qwen3-ASR-0.6B-4bit
+AURAL_MODELSCOPE_ASR_MODEL=mlx-community/Qwen3-ASR-1.7B-4bit
+AURAL_HF_ASR_MODEL=mlx-community/Qwen3-ASR-1.7B-4bit
+AURAL_MODELSCOPE_ASR_MODEL_ACCURATE=mlx-community/Qwen3-ASR-1.7B-bf16
+AURAL_HF_ASR_MODEL_ACCURATE=mlx-community/Qwen3-ASR-1.7B-bf16
+AURAL_MODELSCOPE_ALIGNER_MODEL=mlx-community/Qwen3-ForcedAligner-0.6B-4bit
+AURAL_HF_ALIGNER_MODEL=mlx-community/Qwen3-ForcedAligner-0.6B-4bit
+AURAL_ALIGNMENT_ENABLED=1
+```
+
+## Build A Full Offline Package
+
+Only use this when a fully self-contained build is required:
 
 ```bash
 scripts/build-local-app.sh \
   --include-runtime \
   --include-model \
   --venv-source /path/to/asr-python-venv \
+  --python-base-source /path/to/cpython-3.12 \
   --model-source /path/to/qwen3-asr-1.7b-4bit \
-  --aligner-model-source /path/to/qwen3-forcedaligner-0.6b-4bit-mlx
+  --aligner-model-source /path/to/qwen3-forcedaligner-0.6b-4bit-mlx \
+  --itn-fst-source /path/to/custom-wetext-fsts
 ```
 
-`--include-model` copies both `qwen3-asr-1.7b-4bit` and `qwen3-forcedaligner-0.6b-4bit-mlx`. Override the aligner source with `AURAL_ALIGNER_MODEL_SOURCE` or `--aligner-model-source` if needed.
+`--include-model` copies both models into the app bundle:
 
-To create a local DMG from the app bundle:
+```text
+Contents/Resources/asr-models/qwen3-asr-1.7b-4bit
+Contents/Resources/aligner-models/qwen3-forcedaligner-0.6b-4bit-mlx
+```
+
+The full offline package is much larger and may exceed convenient GitHub Release distribution size. The default 0.1.0 public release should use the lightweight package.
+
+## Create A DMG
 
 ```bash
 scripts/package-local-dmg.sh
@@ -72,97 +133,88 @@ scripts/package-local-dmg.sh
 
 The DMG script names packages with the app version and timestamp, then prunes old local Aural packages in `.build/release`. By default it keeps only the latest 3 files matching `Aural-*.dmg`, `Aural-*.pkg`, or `Aural-*.zip`; set `AURAL_PACKAGE_KEEP_COUNT=<n>` only when a larger local package history is needed.
 
-For VAD/chunked development smoke tests, ffmpeg/ffprobe and their native dependency closure can also be copied:
+If a future full offline package exceeds GitHub's single-asset limit, `scripts/package-release-split.sh` can split it as a fallback. Do not use split assets for the default lightweight 0.1.0 release.
+
+## Sign And Notarize The Public DMG
+
+Local development bundles may use ad-hoc signing. Public 0.1.0 release bundles must use a Developer ID Application certificate and Apple notarization.
+
+Create a notarytool keychain profile once on the release Mac:
 
 ```bash
-scripts/build-local-app.sh \
-  --include-runtime \
-  --include-model \
-  --include-homebrew-ffmpeg \
-  --venv-source /path/to/asr-python-venv \
-  --model-source /path/to/qwen3-asr-1.7b-4bit \
-  --aligner-model-source /path/to/qwen3-forcedaligner-0.6b-4bit-mlx
+xcrun notarytool store-credentials AuralNotaryProfile \
+  --apple-id apple-id@example.com \
+  --team-id TEAMID
 ```
 
-The script rewrites copied dylib references into `Contents/Resources/runtime/lib`. This is still a development packaging path until ffmpeg licensing, notarization, and architecture coverage are reviewed.
+For the release build, pass either `AURAL_CODESIGN_IDENTITY` or `--codesign-identity`:
 
-Runtime behavior:
+```bash
+AURAL_CODESIGN_REQUIRE_DEVELOPER_ID=1 \
+AURAL_CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+scripts/build-local-app.sh --include-runtime \
+  --venv-source /path/to/asr-python-venv \
+  --python-base-source /path/to/cpython-3.12 \
+  --itn-fst-source /path/to/custom-wetext-fsts
+```
 
-- Swift uses `~/Library/Application Support/Aural` for task data by default.
-- Swift first looks for worker scripts inside `Bundle.main.resourceURL/AuralASRWorker`.
-- The segmented Qwen bundle worker uses `Contents/Resources/runtime`, `Contents/Resources/asr-models/qwen3-asr-1.7b-4bit`, `Contents/Resources/aligner-models/qwen3-forcedaligner-0.6b-4bit-mlx`, and macOS `/usr/bin/afconvert` for native audio conversion.
+After creating the DMG, submit and staple it:
+
+```bash
+AURAL_NOTARYTOOL_PROFILE=AuralNotaryProfile \
+scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0-<timestamp>.dmg
+```
+
+## Runtime Behavior
+
+- Swift stores task data under `~/Library/Application Support/Aural` by default.
+- Swift uses bundled worker scripts when `Contents/Resources/AuralASRWorker` is present.
+- Swift probes the bundled MLX runtime before model download and before transcription resources are marked ready. If the Metal runtime cannot load on the current system, Aural fails early instead of downloading model files and then failing during transcription.
+- The segmented Qwen worker is the production default.
+- The worker uses bundled runtime Python and resolves models from `AURAL_MODEL_ROOT`, app support cache, or bundled model directories.
 - Video imports are audio-extracted through AVFoundation; the app does not retain the original video copy after import.
-- If bundled runtime/model are present, Swift chooses `worker_qwen_segmented_bundle.py` first.
-- If bundled runtime/model are missing, the app falls back to the bundled stub worker for local UI/queue testing.
+- Supported video OCR context enhancement is currently not bundled.
 
-The segmented worker is the current default. It normalizes supported audio through macOS `afconvert`, uses app-local `soundfile`/`numpy` segmentation, transcribes each audio segment with the bundled Qwen model, and refines paragraph timestamps with the bundled Qwen3 forced aligner when available. Successful alignment writes `timestamp_method: qwen3_forced_aligner_paragraph` and `alignment.json`; alignment failure falls back to `vad_speech_weighted_paragraph` or `audio_segmented`.
+The segmented worker normalizes supported audio through macOS `afconvert`, uses local `soundfile`/`numpy` segmentation, transcribes each audio segment with Qwen3-ASR, and refines paragraph timestamps with Qwen3-ForcedAligner when alignment is enabled and available. Successful alignment writes `timestamp_method: qwen3_forced_aligner_paragraph` and `alignment.json`; disabled or failed alignment falls back to `vad_speech_weighted_paragraph` or `audio_segmented`.
 
-All workers run conservative ITN after ASR when FST rules are bundled. The app displays normalized text, while `transcript.json` keeps `raw_text`, `normalized_text`, `metadata.itn`, and `metadata.alignment`. The build script copies WeText FST rules from `AURAL_ITN_FST_SOURCE` or `--itn-fst-source` when provided. If the path is missing, the bundle still builds and the worker falls back to raw ASR text.
+All workers run conservative ITN after ASR when FST rules are bundled. The app displays normalized text, while `transcript.json` keeps `raw_text`, `normalized_text`, `metadata.itn`, and `metadata.alignment`. If ITN rules are missing, the bundle still builds and the worker falls back to raw ASR text.
 
 `worker_qwen_direct_bundle.py` remains a no-segmentation fallback and smoke-test baseline. It writes `timestamp_method: text_length_proportional`.
 
-`worker_qwen_bundle.py` remains the explicit ffmpeg-backed VAD/chunked development path. Do not make it the default until the packaged audio probing/extraction dependency is replaced or fixed: copied ffprobe builds have shown reliability issues during short-audio smoke tests.
+`worker_qwen_bundle.py` remains the explicit ffmpeg-backed VAD/chunked development path. Do not make it the default until packaged audio probing/extraction dependencies are reviewed.
 
-Current runtime progress:
-
-- `--include-runtime` copies the selected CPython base and virtual environment into `Contents/Resources/runtime`.
-- `runtime/bin/python3` is a wrapper that sets `PYTHONHOME` and `PYTHONPATH` to app-local paths.
-- `runtime/bin/python3` also sets `PYTHONDONTWRITEBYTECODE=1` so ASR execution does not write `__pycache__` into the signed app bundle.
-- The package-local Python can import `mlx_audio`, `mlx`, `numpy`, `soundfile`, `scipy`, `silero_vad`, and `torch`.
-- `--include-model` copies the real 1.5G ASR model directory into `Contents/Resources/asr-models/qwen3-asr-1.7b-4bit` and the 931M forced aligner model into `Contents/Resources/aligner-models/qwen3-forcedaligner-0.6b-4bit-mlx`.
-- `worker_qwen_segmented_bundle.py` has been smoke-tested with the bundled Python runtime and bundled model, without package-manager binaries in `PATH`.
-- `worker_qwen_direct_bundle.py` has also been smoke-tested with the bundled Python runtime and bundled model as a fallback path.
-- `worker_qwen_bundle.py` is available for explicit VAD/chunked experiments with the bundled Python runtime, bundled model, and copied ffmpeg dependency closure, but this path is not currently accepted as the default runtime.
-- The generated ASR output is written to Aural's `transcript.json` schema.
-- Video files are transcribed through extracted audio; no OCR dependencies are bundled.
-- Segmented worker metadata uses `timestamp_method: qwen3_forced_aligner_paragraph` when local forced alignment succeeds, with alignment details under `metadata.alignment`.
-- Segmented worker metadata uses `timestamp_method: vad_speech_weighted_paragraph` when local RMS-VAD paragraph timing succeeds but forced alignment is unavailable or failed, with VAD details under `metadata.vad`.
-- Segmented worker falls back to `timestamp_method: audio_segmented` if speech intervals are unavailable or invalid.
-- Direct fallback metadata uses `timestamp_method: text_length_proportional`.
-- The post-smoke bundle still passes `codesign --verify --deep --strict`.
-
-Known gap:
-
-- Segmented packaged ASR is closed-loop and produces audio-segment-derived timestamps without ffmpeg/ffprobe.
-- The explicit ffmpeg-backed VAD/chunked path is still not a production default because copied ffprobe builds have shown reliability issues.
-
-Suggested verification:
+## Verification
 
 ```bash
 swift build
+swift run aural-test
 swift run aural-validate
-scripts/validate-itn-postprocess.py
-swift run aural-prototype
-scripts/build-local-app.sh --include-runtime --include-model \
+scripts/audit-open-source.sh
+scripts/pin-mlx-runtime-platform.sh /path/to/asr-python-venv macosx_14_0_arm64
+AURAL_RUNTIME_MIN_MACOS=14.0 \
+AURAL_CODESIGN_REQUIRE_DEVELOPER_ID=1 \
+AURAL_CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+scripts/build-local-app.sh --include-runtime \
   --venv-source /path/to/asr-python-venv \
-  --model-source /path/to/qwen3-asr-1.7b-4bit \
-  --aligner-model-source /path/to/qwen3-forcedaligner-0.6b-4bit-mlx
+  --python-base-source /path/to/cpython-3.12 \
+  --itn-fst-source /path/to/custom-wetext-fsts
+AURAL_RUNTIME_MIN_MACOS=14.0 scripts/audit-runtime-compatibility.sh .build/release/Aural.app
 codesign --verify --deep --strict --verbose=2 .build/release/Aural.app
+spctl --assess --type execute --verbose=4 .build/release/Aural.app
 scripts/package-local-dmg.sh
-scripts/package-release-split.sh .build/release/Aural-0.1.0.dmg
-scripts/validate-direct-segments.py
-scripts/validate-segmented-worker.py
-scripts/smoke-direct-bundle-worker.sh
-scripts/smoke-app-queue-bundle.sh
-scripts/audit-bundle-runtime.sh
+scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0-<timestamp>.dmg
 ```
 
-The generated bundle should pass ad-hoc codesign verification.
+Run `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-itn-postprocess.py` when the release bundle includes custom WeText ITN FST rules. If rules are not bundled, the worker keeps raw ASR text and records ITN fallback metadata.
 
-Recent smoke test shape:
+Optional smoke tests that run real ASR need a complete model cache or a full offline bundle:
 
-- Bundle size: about `2.5G`
-- Runtime size: about `1.0G`
-- Model size: about `1.5G`
-- Direct worker output: `loading` progress, `transcribing` progress, then `completed`
-- Direct fallback transcript path: `.build/direct-worker-smoke/task/transcript.json`
-- Direct fallback timestamp method: `text_length_proportional`
-- App queue smoke verifies the default segmented worker timestamp method.
-- App queue smoke path: `.build/app-queue-smoke/data/tasks/<task_id>/`
-- App queue smoke verifies audio is copied into app-owned task storage before transcription.
-- App queue smoke also verifies a bad `.wav` reaches terminal status `转写失败` and writes `error.log` under the task directory.
-- Validation also covers a worker process that writes stderr and exits non-zero; stderr and exit status are persisted to `error.log`.
-- Validation covers startup recovery: interrupted `转写中` tasks return to `未开始` and can then complete through the queue.
-- Validation covers supported audio extensions: `mp3`, `m4a`, `wav`, `aac`, and `flac`.
-- Validation covers supported video import extensions: `mp4`, `mov`, and `m4v`; video files are extracted to app-owned `m4a` audio before transcription.
-- Audit result for a release bundle should show no personal local paths or unresolved package-manager dynamic library references.
+```bash
+AURAL_MODEL_ROOT="$HOME/Library/Application Support/Aural/Models" \
+scripts/smoke-direct-bundle-worker.sh
+
+AURAL_MODEL_ROOT="$HOME/Library/Application Support/Aural/Models" \
+scripts/smoke-app-queue-bundle.sh
+```
+
+The generated public bundle should pass Developer ID codesign verification, notarization, stapling, Gatekeeper assessment, and should not contain personal local paths, OCR runtime payloads, or unresolved package-manager dynamic library references.

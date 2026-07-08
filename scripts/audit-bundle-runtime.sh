@@ -21,10 +21,25 @@ echo
 echo "python imports:"
 "$RESOURCES_DIR/runtime/bin/python3" - <<'PY'
 import importlib.util
-for name in ["mlx_audio", "mlx", "numpy", "soundfile", "scipy", "silero_vad", "torch"]:
+import sys
+
+required = ["mlx_audio", "mlx", "numpy", "soundfile", "scipy", "modelscope", "huggingface_hub"]
+optional = ["silero_vad", "torch"]
+missing_required = []
+
+for name in required + optional:
     spec = importlib.util.find_spec(name)
     print(f"{name}: {'ok' if spec else 'missing'}")
+    if name in required and not spec:
+        missing_required.append(name)
+
+if missing_required:
+    raise SystemExit(f"missing required runtime imports: {', '.join(missing_required)}")
 PY
+
+echo
+echo "runtime compatibility:"
+bash "$ROOT_DIR/scripts/audit-runtime-compatibility.sh" "$APP_DIR"
 
 echo
 echo "external dynamic library references:"

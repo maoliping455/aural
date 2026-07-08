@@ -8,6 +8,22 @@ APP_DIR="$ROOT_DIR/.build/release/Aural.app"
 
 mkdir -p "$REPORT_DIR"
 
+if [[ -z "${AURAL_VENV_SOURCE:-}" && -z "${AURAL_PYTHON_BASE_SOURCE:-}" ]]; then
+  cat >&2 <<'EOF'
+scripts/audit-core.sh needs a release runtime source.
+
+Set at least:
+  AURAL_VENV_SOURCE=/path/to/asr-python-venv
+
+Usually also set:
+  AURAL_PYTHON_BASE_SOURCE=/path/to/cpython-3.12
+  AURAL_ITN_FST_SOURCE=/path/to/custom-wetext-fsts
+
+Then rerun scripts/audit-core.sh.
+EOF
+  exit 1
+fi
+
 log_step() {
   local text="$1"
   echo "==> $text"
@@ -34,14 +50,14 @@ swift run aural-validate
 log_step "Run stub prototype for serial queue success and failure"
 swift run aural-prototype
 
-log_step "Build local Aural.app with bundled runtime and bundled Qwen model"
-scripts/build-local-app.sh --include-runtime --include-model > "$REPORT_DIR/build-app.log"
+log_step "Build local Aural.app with bundled runtime and first-run model preparation"
+scripts/build-local-app.sh --include-runtime > "$REPORT_DIR/build-app.log"
 
 log_step "Validate direct worker text segmentation helpers"
-scripts/validate-direct-segments.py
+env PYTHONDONTWRITEBYTECODE=1 scripts/validate-direct-segments.py
 
 log_step "Validate macOS afconvert audio segmentation helpers"
-scripts/validate-segmented-worker.py
+env PYTHONDONTWRITEBYTECODE=1 scripts/validate-segmented-worker.py
 
 log_step "Smoke test bundled direct Qwen worker"
 scripts/smoke-direct-bundle-worker.sh > "$REPORT_DIR/direct-worker-smoke.log"

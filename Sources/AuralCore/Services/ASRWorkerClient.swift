@@ -15,15 +15,18 @@ public final class ASRWorkerClient {
     public let workerURL: URL
     public let pythonExecutableURL: URL
     public let timeoutSeconds: TimeInterval?
+    public let environment: [String: String]
 
     public init(
         workerURL: URL,
         pythonExecutableURL: URL = RuntimePaths.defaultPythonExecutableURL(),
-        timeoutSeconds: TimeInterval? = ASRWorkerClient.defaultTimeoutSeconds
+        timeoutSeconds: TimeInterval? = ASRWorkerClient.defaultTimeoutSeconds,
+        environment: [String: String] = [:]
     ) {
         self.workerURL = workerURL
         self.pythonExecutableURL = pythonExecutableURL
         self.timeoutSeconds = timeoutSeconds
+        self.environment = environment
     }
 
     public func transcribe(
@@ -46,6 +49,9 @@ public final class ASRWorkerClient {
         let process = Process()
         process.executableURL = pythonExecutableURL
         process.arguments = workerArguments()
+        process.environment = ProcessInfo.processInfo.environment
+            .merging(RuntimePaths.workerEnvironment()) { _, new in new }
+            .merging(environment) { _, new in new }
 
         let stdin = Pipe()
         let stdout = Pipe()

@@ -43,8 +43,14 @@ def require(condition, message):
         raise SystemExit(f"validation failed: {message}")
 
 
+def require_fst(language, relative_path):
+    path = FST_ROOT / language / "itn" / relative_path
+    require(path.exists(), f"required ITN FST missing: {path}")
+
+
 def main():
     require(FST_ROOT.exists(), f"ITN FST root should exist: {FST_ROOT}")
+    require_fst("zh", "tagger_no_standalone.fst")
     os.environ["AURAL_ITN_FST_ROOT"] = str(FST_ROOT)
 
     raw_text = "今天是二零二六年七月二日，电话号码是一三八零零一三八零零零。"

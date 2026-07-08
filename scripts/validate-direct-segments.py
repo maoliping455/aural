@@ -4,13 +4,52 @@ import importlib.util
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-WORKER_PATH = ROOT_DIR / "AuralASRWorker" / "worker_qwen_direct_bundle.py"
+WORKER_DIR = ROOT_DIR / "AuralASRWorker"
+WORKER_PATH = WORKER_DIR / "worker_qwen_direct_bundle.py"
+sys.path.insert(0, str(WORKER_DIR))
 
 spec = importlib.util.spec_from_file_location("worker_qwen_direct_bundle", WORKER_PATH)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+class DummyGenerateModel:
+    def __init__(self):
+        self.kwargs = None
+
+    def generate(
+        self,
+        audio,
+        max_tokens,
+        verbose,
+        chunk_duration=None,
+        repetition_penalty=None,
+        repetition_context_size=None,
+        language=None,
+    ):
+        self.kwargs = {
+            "audio": audio,
+            "max_tokens": max_tokens,
+            "verbose": verbose,
+            "chunk_duration": chunk_duration,
+            "repetition_penalty": repetition_penalty,
+            "repetition_context_size": repetition_context_size,
+            "language": language,
+        }
+        return "ok"
+
+
+dummy_model = DummyGenerateModel()
+module.generate_one(dummy_model, Path("sample.wav"), "zh")
+if dummy_model.kwargs["chunk_duration"] != 30.0:
+    raise SystemExit(f"direct ASR should request 30s generation chunks: {dummy_model.kwargs}")
+if dummy_model.kwargs["repetition_penalty"] != 1.10:
+    raise SystemExit(f"direct ASR should request conservative repetition penalty: {dummy_model.kwargs}")
+if dummy_model.kwargs["repetition_context_size"] != 32:
+    raise SystemExit(f"direct ASR should request repetition context size: {dummy_model.kwargs}")
 
 text = (
     "今天主要讨论的是本地转写工具的核心范围。"

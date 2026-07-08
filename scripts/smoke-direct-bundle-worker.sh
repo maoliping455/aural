@@ -6,6 +6,8 @@ APP_DIR="$ROOT_DIR/.build/release/Aural.app"
 WORK_DIR="$ROOT_DIR/.build/direct-worker-smoke"
 PYTHON="$APP_DIR/Contents/Resources/runtime/bin/python3"
 WORKER="$APP_DIR/Contents/Resources/AuralASRWorker/worker_qwen_direct_bundle.py"
+MODEL_ROOT="${AURAL_MODEL_ROOT:-$HOME/Library/Application Support/Aural/Models}"
+MODEL_PROFILE="${AURAL_MODEL_PROFILE:-balanced}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "packaged python not found: $PYTHON" >&2
@@ -30,7 +32,7 @@ printf '{"type":"transcribe","request_id":"%s","task_id":"%s","audio_path":"%s",
   "$TASK_ID" \
   "$WORK_DIR/input.wav" \
   "$WORK_DIR/task" \
-  | env -i PATH=/usr/bin:/bin HOME="$HOME" "$PYTHON" "$WORKER" \
+  | env -i PATH=/usr/bin:/bin HOME="$HOME" AURAL_MODEL_ROOT="$MODEL_ROOT" AURAL_MODEL_PROFILE="$MODEL_PROFILE" AURAL_ALIGNMENT_ENABLED=0 "$PYTHON" "$WORKER" \
   | tee "$WORK_DIR/events.jsonl"
 
 "$PYTHON" - <<PY

@@ -184,6 +184,11 @@ public final class TaskStore {
 
     @discardableResult
     public func pauseTasks(ids: Set<UUID>) throws -> [TranscriptionTask] {
+        try stopTasks(ids: ids)
+    }
+
+    @discardableResult
+    public func stopTasks(ids: Set<UUID>) throws -> [TranscriptionTask] {
         guard !ids.isEmpty else {
             return []
         }
@@ -210,6 +215,11 @@ public final class TaskStore {
 
     @discardableResult
     public func resumeTasks(ids: Set<UUID>) throws -> [TranscriptionTask] {
+        try startTasks(ids: ids)
+    }
+
+    @discardableResult
+    public func startTasks(ids: Set<UUID>) throws -> [TranscriptionTask] {
         guard !ids.isEmpty else {
             return []
         }
@@ -217,7 +227,9 @@ public final class TaskStore {
         var tasks = try load()
         var changed: [TranscriptionTask] = []
         for index in tasks.indices where ids.contains(tasks[index].id) {
-            guard tasks[index].status == .paused else {
+            guard tasks[index].status == .pending
+                    || tasks[index].status == .paused
+                    || tasks[index].status == .failed else {
                 continue
             }
             tasks[index].status = .pending
@@ -227,6 +239,7 @@ public final class TaskStore {
             tasks[index].transcriptPath = nil
             tasks[index].errorLogPath = nil
             tasks[index].progressFraction = nil
+            removeGeneratedOutputs(for: tasks[index].id)
             changed.append(tasks[index])
         }
 
@@ -258,6 +271,69 @@ public final class TaskStore {
         return recovered
     }
 
+    @discardableResult
+    public func repairInvalidCompletedTasks() throws -> [TranscriptionTask] {
+        var tasks = try load()
+        var repaired: [TranscriptionTask] = []
+
+        for index in tasks.indices where tasks[index].status == .done {
+            guard let reason = invalidCompletedTranscriptReason(for: tasks[index]) else {
+                continue
+            }
+
+            tasks[index].status = .failed
+            tasks[index].failedAt = Date()
+            tasks[index].transcriptPath = nil
+            tasks[index].progressFraction = nil
+            tasks[index].errorLogPath = appendTaskErrorLog(
+                taskId: tasks[index].id,
+                message: reason
+            )
+            repaired.append(tasks[index])
+        }
+
+        if !repaired.isEmpty {
+            try save(tasks)
+        }
+
+        return repaired
+    }
+
+    @discardableResult
+    public func repairFailedTasksWithValidTranscript() throws -> [TranscriptionTask] {
+        var tasks = try load()
+        var repaired: [TranscriptionTask] = []
+
+        for index in tasks.indices where tasks[index].status == .failed {
+            let taskDirectoryTranscriptURL = taskDirectoryURL(for: tasks[index].id)
+                .appendingPathComponent("transcript.json")
+            let transcriptURL = tasks[index].transcriptPath
+                .flatMap { path -> URL? in
+                    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return trimmed.isEmpty ? nil : URL(fileURLWithPath: trimmed)
+                }
+                ?? taskDirectoryTranscriptURL
+
+            guard transcriptValidationReason(for: tasks[index], transcriptURL: transcriptURL) == nil else {
+                continue
+            }
+
+            tasks[index].status = .done
+            tasks[index].completedAt = tasks[index].failedAt ?? Date()
+            tasks[index].failedAt = nil
+            tasks[index].transcriptPath = transcriptURL.path
+            tasks[index].errorLogPath = nil
+            tasks[index].progressFraction = nil
+            repaired.append(tasks[index])
+        }
+
+        if !repaired.isEmpty {
+            try save(tasks)
+        }
+
+        return repaired
+    }
+
     public func deleteTask(id: UUID) throws {
         var tasks = try load()
         guard let index = tasks.firstIndex(where: { $0.id == id }) else {
@@ -281,6 +357,82 @@ public final class TaskStore {
             return 0
         }
         return player.duration
+    }
+
+    private func invalidCompletedTranscriptReason(for task: TranscriptionTask) -> String? {
+        guard let transcriptPath = task.transcriptPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !transcriptPath.isEmpty else {
+            return "completed task has no transcript path"
+        }
+
+        return transcriptValidationReason(for: task, transcriptURL: URL(fileURLWithPath: transcriptPath))
+    }
+
+    func transcriptValidationReason(for task: TranscriptionTask, transcriptURL: URL) -> String? {
+        let normalizedTranscriptURL = transcriptURL.standardizedFileURL
+        let normalizedTaskDirectory = taskDirectoryURL(for: task.id).standardizedFileURL
+        let taskDirectoryPath = normalizedTaskDirectory.path
+        let transcriptPath = normalizedTranscriptURL.path
+
+        guard transcriptPath == taskDirectoryPath || transcriptPath.hasPrefix(taskDirectoryPath + "/") else {
+            return "completed task transcript is outside task directory: \(transcriptPath)"
+        }
+
+        guard fileManager.fileExists(atPath: transcriptPath) else {
+            return "completed task transcript file is missing: \(transcriptPath)"
+        }
+
+        let transcript: Transcript
+        do {
+            transcript = try TranscriptStore.load(from: normalizedTranscriptURL)
+        } catch {
+            return "completed task transcript is unreadable: \(transcriptPath); \(String(describing: error))"
+        }
+
+        guard transcript.taskId == task.id else {
+            return "completed task transcript task id mismatch: expected \(task.id.uuidString), got \(transcript.taskId.uuidString)"
+        }
+
+        guard transcriptHasUsableText(transcript) else {
+            return "completed task transcript is empty: \(transcriptPath)"
+        }
+        return nil
+    }
+
+    private func transcriptHasUsableText(_ transcript: Transcript) -> Bool {
+        let hasText = !transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasSegmentText = transcript.segments.contains {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return hasText || hasSegmentText
+    }
+
+    private func removeGeneratedOutputs(for taskId: UUID) {
+        let taskDirectory = taskDirectoryURL(for: taskId)
+        for filename in ["transcript.json", "alignment.json", "error.log"] {
+            let url = taskDirectory.appendingPathComponent(filename)
+            if fileManager.fileExists(atPath: url.path) {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+    }
+
+    private func appendTaskErrorLog(taskId: UUID, message: String) -> String {
+        let taskDirectory = taskDirectoryURL(for: taskId)
+        let errorLogURL = taskDirectory.appendingPathComponent("error.log")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let text = "[\(timestamp)] \(message)\n"
+
+        try? fileManager.createDirectory(at: taskDirectory, withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: errorLogURL.path),
+           let handle = try? FileHandle(forWritingTo: errorLogURL) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: errorLogURL, options: .atomic)
+        }
+        return errorLogURL.path
     }
 
 }

@@ -21,6 +21,9 @@ def resolve_aligner_model_root():
     override = os.environ.get("AURAL_ALIGNER_MODEL")
     if override:
         return Path(override).expanduser()
+    model_root = os.environ.get("AURAL_MODEL_ROOT")
+    if model_root:
+        return Path(model_root).expanduser() / ALIGNER_MODEL_DIRNAME
     return resolve_resources_root() / "aligner-models" / ALIGNER_MODEL_DIRNAME
 
 

@@ -2,6 +2,8 @@
 
 Aural uses one JSON object per line over stdin/stdout for the first technical prototype.
 
+For persisted transcript artifacts, see [Transcript Schema](transcript-schema.md).
+
 The app writes a request to worker stdin:
 
 ```json

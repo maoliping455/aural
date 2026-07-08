@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 
+sys.dont_write_bytecode = True
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RUNTIME_PYTHON = ROOT_DIR / ".build" / "release" / "Aural.app" / "Contents" / "Resources" / "runtime" / "bin" / "python3"
@@ -42,6 +43,57 @@ if normalize_spaced_acronyms("保留A B测试和C P U") != "保留AB测试和CPU
 if normalize_spaced_acronyms("不要影响ABCword") != "不要影响ABCword":
     raise SystemExit("spaced acronym cleanup should preserve normal English boundaries")
 
+
+class DummyGenerateModel:
+    def __init__(self):
+        self.kwargs = None
+
+    def generate(
+        self,
+        audio,
+        max_tokens,
+        verbose,
+        chunk_duration=None,
+        repetition_penalty=None,
+        repetition_context_size=None,
+        language=None,
+        system_prompt=None,
+    ):
+        self.kwargs = {
+            "audio": audio,
+            "max_tokens": max_tokens,
+            "verbose": verbose,
+            "chunk_duration": chunk_duration,
+            "repetition_penalty": repetition_penalty,
+            "repetition_context_size": repetition_context_size,
+            "language": language,
+            "system_prompt": system_prompt,
+        }
+        return "ok"
+
+
+dummy_model = DummyGenerateModel()
+worker.generate_one(dummy_model, Path("sample.wav"), "zh", system_prompt="prompt")
+if dummy_model.kwargs["chunk_duration"] != 30.0:
+    raise SystemExit(f"segmented ASR should request 30s generation chunks: {dummy_model.kwargs}")
+if dummy_model.kwargs["repetition_penalty"] != 1.10:
+    raise SystemExit(f"segmented ASR should request conservative repetition penalty: {dummy_model.kwargs}")
+if dummy_model.kwargs["repetition_context_size"] != 32:
+    raise SystemExit(f"segmented ASR should request repetition context size: {dummy_model.kwargs}")
+
+previous_profile = os.environ.get("AURAL_MODEL_PROFILE")
+os.environ["AURAL_MODEL_PROFILE"] = "accurate"
+try:
+    accurate_model = DummyGenerateModel()
+    worker.generate_one(accurate_model, Path("sample.wav"), "zh")
+    if accurate_model.kwargs["repetition_penalty"] is not None:
+        raise SystemExit(f"accurate ASR should not request default repetition penalty: {accurate_model.kwargs}")
+finally:
+    if previous_profile is None:
+        os.environ.pop("AURAL_MODEL_PROFILE", None)
+    else:
+        os.environ["AURAL_MODEL_PROFILE"] = previous_profile
+
 sample_rate = 16000
 duration_sec = 260
 t = np.linspace(0, duration_sec, sample_rate * duration_sec, endpoint=False)
@@ -50,6 +102,14 @@ samples = speech.copy()
 
 samples[sample_rate * 115 : sample_rate * 121] = 0
 samples[sample_rate * 236 : sample_rate * 242] = 0
+
+default_segments, _ = worker.build_audio_segments(samples, sample_rate)
+if len(default_segments) < 3:
+    raise SystemExit(f"default 60/90 segmentation should produce multiple chunks: {default_segments}")
+for segment in default_segments:
+    length = segment["end_sec"] - segment["start_sec"]
+    if length > worker.OUTER_CHUNK_MAX_SEC + 0.001:
+        raise SystemExit(f"default segment exceeds max chunk duration: {segment}")
 
 segments, duration = worker.build_audio_segments(
     samples,
