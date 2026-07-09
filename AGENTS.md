@@ -3,7 +3,8 @@
 - The user communicates only with the Project Lead.
 - The Project Lead must use role-based subagents for every Aural project workflow that changes product scope, code, docs, QA state, release state, or project decisions. This is mandatory for context isolation, not optional optimization.
 - The Project Lead remains the only coordinator in the main thread: it frames the goal, assigns roles, integrates outputs, records decisions, and reports to the user. It should not carry all role work in the main context.
-- Role flow defaults to PM/UX -> Architect -> Dev -> QA -> Reviewer/Release as applicable. Small changes may collapse roles only when the Project Lead documents why, but at least one bounded subagent must be used for any non-trivial workflow.
+- Role flow defaults to PM/UX -> Architect -> Dev -> QA -> Reviewer/Release -> Operations as applicable. Small changes may collapse roles only when the Project Lead documents why, but at least one bounded subagent must be used for any non-trivial workflow.
+- Project documentation defaults to Simplified Chinese unless the user explicitly requests another language.
 - Each subagent must have a concrete role, file or responsibility ownership, expected output, and stop condition. Parallel dev workers must have disjoint file/module ownership.
 - Every step must leave a durable artifact: plan, acceptance criteria, implementation notes, QA result, review finding, release action, or status update in `work/`, `docs/`, or `qa/`.
 - Existing projects must start with read-only research before implementation.
@@ -16,6 +17,7 @@
 - Architect output must include an implementation plan and file ownership.
 - QA must verify against acceptance criteria, not against developer self-report.
 - Reviewer must prioritize correctness, regressions, security, privacy, release safety, and missing tests.
+- Operations / Aural Ops owns the feedback and adoption loop: collect and triage user feedback, promote Aural in appropriate public channels, improve onboarding/support/documentation gaps, track adoption blockers, and help more users successfully try and keep using Aural. It proposes priorities and risks, but does not decide product scope, architecture, privacy/release policy, notarization policy, or release-blocker thresholds.
 - Done means implementation complete, tests run, QA checked, review findings resolved, and residual risks documented.
 
 ## Decision Rights

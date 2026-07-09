@@ -6,6 +6,7 @@ CONFIGURATION="${AURAL_CONFIGURATION:-release}"
 RELEASE_DIR="$ROOT_DIR/.build/$CONFIGURATION"
 APP_DIR="$RELEASE_DIR/Aural.app"
 KEEP_COUNT="${AURAL_PACKAGE_KEEP_COUNT:-3}"
+CODE_SIGN_IDENTITY="${AURAL_CODESIGN_IDENTITY:-}"
 
 if [[ ! -d "$APP_DIR" ]]; then
   echo "app bundle not found: $APP_DIR" >&2
@@ -27,6 +28,9 @@ ditto "$APP_DIR" "$STAGING_DIR/Aural.app"
 ln -s /Applications "$STAGING_DIR/Applications"
 
 hdiutil create -volname Aural -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH"
+if [[ -n "$CODE_SIGN_IDENTITY" ]]; then
+  codesign --force --timestamp --sign "$CODE_SIGN_IDENTITY" "$DMG_PATH" >/dev/null
+fi
 hdiutil verify "$DMG_PATH"
 
 "$ROOT_DIR/scripts/prune-release-packages.sh" --dir "$RELEASE_DIR" --keep "$KEEP_COUNT"

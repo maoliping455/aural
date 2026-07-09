@@ -10,14 +10,15 @@
 2. Project Lead 不在主线程承载完整流程上下文；主线程只做目标澄清、角色拆分、决策、集成和汇报。
 3. 每个会改变产品范围、代码、文档、QA 状态、release 状态或项目决策的流程，都必须使用角色化子 agent 做上下文隔离。
 4. 每一步必须有明确输入、角色 owner、输出文档、验收标准和停止条件。
-5. 大量原始材料、实验输出、QA 证据和中间结论必须落盘；对话里只保留摘要、决策和路径。
+5. 项目文档默认使用简体中文，除非用户明确指定英文或其他语言。
+6. 大量原始材料、实验输出、QA 证据和中间结论必须落盘；对话里只保留摘要、决策和路径。
 
 ## 默认角色流
 
 默认流程：
 
 ```text
-PM / UX -> Architect -> Dev -> QA -> Reviewer / Release -> Project Lead 汇总
+PM / UX -> Architect -> Dev -> QA -> Reviewer / Release -> Operations -> Project Lead 汇总
 ```
 
 不同任务可以裁剪角色，但必须记录裁剪原因：
@@ -28,6 +29,7 @@ PM / UX -> Architect -> Dev -> QA -> Reviewer / Release -> Project Lead 汇总
 - QA：按 acceptance criteria 验证，不以开发自报为准。
 - Reviewer：检查 correctness、regression、privacy、security、release safety 和 missing tests。
 - Release：检查包、签名、notarization、release notes、资产和发布证据。
+- Operations / Aural Ops：负责 Aural 的反馈与增长闭环，包括收集和分流用户反馈、宣传 Aural、维护公开渠道与用户沟通、发现 onboarding/安装/文档/支持缺口、跟踪 adoption blocker，并推动更多用户成功试用和持续使用 Aural。Operations 提供证据、风险和优先级建议，但不直接决定产品范围、架构、隐私策略、release blocker、notarization 策略或是否发布。
 - Research：做只读调查、资料整理和风险分析。
 
 ## 子 Agent 使用规则

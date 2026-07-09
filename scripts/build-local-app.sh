@@ -102,6 +102,37 @@ copy_homebrew_binary_with_deps() {
   rm -f "$processed_file_list"
 }
 
+is_macho_file() {
+  local path="$1"
+  file "$path" 2>/dev/null | grep -q 'Mach-O'
+}
+
+sign_nested_macho_payload() {
+  local root_dir="$1"
+  local identity="$2"
+
+  while IFS= read -r binary; do
+    [[ -f "$binary" ]] || continue
+    if ! is_macho_file "$binary"; then
+      continue
+    fi
+    chmod +w "$binary" 2>/dev/null || true
+    codesign --force --options runtime --timestamp --sign "$identity" "$binary" >/dev/null
+  done < <(
+    find "$root_dir" -type f \( -perm -111 -o -name '*.dylib' -o -name '*.so' \) | sort
+  )
+}
+
+normalize_python_runtime_install_names() {
+  local runtime_dir="$1"
+  local libpython="$runtime_dir/cpython/lib/libpython3.12.dylib"
+
+  if [[ -f "$libpython" ]]; then
+    chmod +w "$libpython" 2>/dev/null || true
+    install_name_tool -id "@rpath/libpython3.12.dylib" "$libpython"
+  fi
+}
+
 prune_runtime_payload() {
   local runtime_dir="$1"
   [[ -d "$runtime_dir/.venv/lib" ]] || return 0
@@ -156,6 +187,8 @@ prune_runtime_payload() {
         rm -rf "$item"
       done < <(find "$site_packages_dir" -maxdepth 1 -name "$pattern" -print)
     done
+
+    find "$site_packages_dir" -type d \( -name test -o -name tests \) -prune -exec rm -rf {} +
   done < <(find "$runtime_dir/.venv/lib" -type d -name site-packages)
 
   find "$runtime_dir" -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -277,6 +310,7 @@ PY
   ditto "$VENV_SOURCE" "$RESOURCES_DIR/runtime/.venv"
   ditto "$PYTHON_BASE_SOURCE" "$RESOURCES_DIR/runtime/cpython"
   prune_runtime_payload "$RESOURCES_DIR/runtime"
+  normalize_python_runtime_install_names "$RESOURCES_DIR/runtime"
 
   mkdir -p "$RESOURCES_DIR/runtime/bin"
   rm -f "$RESOURCES_DIR/runtime/.venv/bin/python" \
@@ -390,6 +424,7 @@ find "$APP_DIR" -name '*.pyc' -type f -delete
 
 if command -v codesign >/dev/null 2>&1; then
   if [[ -n "$CODE_SIGN_IDENTITY" ]]; then
+    sign_nested_macho_payload "$APP_DIR" "$CODE_SIGN_IDENTITY"
     codesign_args=(--force --deep --options runtime --timestamp --sign "$CODE_SIGN_IDENTITY")
     if [[ -n "$CODE_SIGN_ENTITLEMENTS" ]]; then
       if [[ ! -f "$CODE_SIGN_ENTITLEMENTS" ]]; then

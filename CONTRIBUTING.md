@@ -1,49 +1,54 @@
-# Contributing
+# 贡献指南
 
-Thanks for helping improve Aural.
+感谢你帮助改进 Aural。
 
-## Local Setup
+Aural 目前优先把 Apple Silicon macOS 上的本地音视频转写链路做稳定。贡献时请保持产品主线清晰：本地优先、交互简单、结果可回放校对、导出可靠。
 
-```bash
-swift build
-swift run aural-validate
-scripts/build-local-app.sh
-```
+## 开始开发
 
-The basic app bundle build does not require bundled models. To test local ASR, pass explicit runtime/model paths:
+本地开发、源码构建、仓库结构和常用验证命令见：
 
-```bash
-scripts/build-local-app.sh \
-  --include-runtime \
-  --include-model \
-  --venv-source /path/to/asr-python-venv \
-  --model-source /path/to/qwen3-asr-1.7b-4bit \
-  --aligner-model-source /path/to/qwen3-forcedaligner-0.6b-4bit-mlx
-```
+- [开发者文档](docs/development.md)
+- [本地 App 打包](docs/packaging.md)
+- [发布说明与安装](docs/release.md)
 
-Optional ITN rules can be passed with `--itn-fst-source /path/to/custom-wetext-fsts`.
-
-## Before Opening a Pull Request
-
-Run:
+最小验证命令：
 
 ```bash
 swift build
 swift run aural-validate
 scripts/audit-open-source.sh
+```
+
+## 提交 PR 前
+
+请至少确认：
+
+- 改动范围清楚，避免把无关重构混进同一个 PR。
+- 用户可见行为、存储格式、worker 协议、模型资源、打包逻辑或隐私边界有变化时，同步更新相关文档。
+- 不提交模型权重、Python runtime 目录、App bundle、DMG、用户媒体、生成 transcript、本地任务数据或实验输出。
+- 能提供验证命令和结果；如果无法验证，说明原因和剩余风险。
+
+建议运行：
+
+```bash
+swift build
+swift run aural-test
+swift run aural-validate
+scripts/audit-open-source.sh
 find . -name '__pycache__' -o -name '*.pyc'
 ```
 
-Do not commit models, Python runtime directories, app bundles, DMGs, user media, transcripts, or local experiment output.
+## 代码与产品约束
 
-## Code Style
+- 主流程保持本地优先，不默认上传音视频或转写文本。
+- 主界面避免暴露过多模型名称、参数和技术配置。
+- worker 的 stdout 保留给 JSON 协议事件，诊断日志写 stderr。
+- 删除任务时只删除 Aural 自己管理的文件和记录，不删除用户原始导入文件。
+- 涉及持久化、导入、队列、worker 协议、导出和删除语义的改动，需要补充或更新验证覆盖。
 
-- Keep product UI simple and local-first.
-- Avoid exposing model names or technical configuration in the main app flow.
-- Keep worker stdout reserved for JSON protocol events and use stderr for diagnostics.
-- Preserve task deletion semantics: delete app-owned files and records, not the user's original import source.
-- Prefer small, focused changes with validation coverage for persistence, import, queue, worker protocol, and export behavior.
+## 发布相关
 
-## Release Work
+发布包、签名、公证、runtime pinning、DMG 和完整离线包说明见 [本地 App 打包](docs/packaging.md) 和 [发布说明与安装](docs/release.md)。
 
-Release bundles can include large model/runtime files, but they must stay out of Git. Use `scripts/package-release-split.sh` to create split assets and checksums.
+Release bundle 可以包含 runtime 或模型资源，但这些大文件必须留在 Git 之外。
