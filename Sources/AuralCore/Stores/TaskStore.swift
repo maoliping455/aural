@@ -204,6 +204,7 @@ public final class TaskStore {
             tasks[index].failedAt = nil
             tasks[index].errorLogPath = nil
             tasks[index].progressFraction = nil
+            tasks[index].progressStage = nil
             changed.append(tasks[index])
         }
 
@@ -239,6 +240,7 @@ public final class TaskStore {
             tasks[index].transcriptPath = nil
             tasks[index].errorLogPath = nil
             tasks[index].progressFraction = nil
+            tasks[index].progressStage = nil
             removeGeneratedOutputs(for: tasks[index].id)
             changed.append(tasks[index])
         }
@@ -261,6 +263,7 @@ public final class TaskStore {
             tasks[index].errorLogPath = nil
             tasks[index].transcriptPath = nil
             tasks[index].progressFraction = nil
+            tasks[index].progressStage = nil
             recovered.append(tasks[index])
         }
 
@@ -285,6 +288,7 @@ public final class TaskStore {
             tasks[index].failedAt = Date()
             tasks[index].transcriptPath = nil
             tasks[index].progressFraction = nil
+            tasks[index].progressStage = nil
             tasks[index].errorLogPath = appendTaskErrorLog(
                 taskId: tasks[index].id,
                 message: reason
@@ -324,6 +328,7 @@ public final class TaskStore {
             tasks[index].transcriptPath = transcriptURL.path
             tasks[index].errorLogPath = nil
             tasks[index].progressFraction = nil
+            tasks[index].progressStage = nil
             repaired.append(tasks[index])
         }
 
@@ -407,13 +412,17 @@ public final class TaskStore {
         return hasText || hasSegmentText
     }
 
-    private func removeGeneratedOutputs(for taskId: UUID) {
+    public func removeGeneratedOutputs(for taskId: UUID) {
         let taskDirectory = taskDirectoryURL(for: taskId)
-        for filename in ["transcript.json", "alignment.json", "error.log"] {
+        for filename in ["transcript.json", "alignment.json", "error.log", "worker-events.jsonl"] {
             let url = taskDirectory.appendingPathComponent(filename)
             if fileManager.fileExists(atPath: url.path) {
                 try? fileManager.removeItem(at: url)
             }
+        }
+        let audioSegmentsURL = taskDirectory.appendingPathComponent("audio-segments", isDirectory: true)
+        if fileManager.fileExists(atPath: audioSegmentsURL.path) {
+            try? fileManager.removeItem(at: audioSegmentsURL)
         }
     }
 

@@ -340,6 +340,17 @@ def generate_text_with_repetition_retry(model, audio_path, language, system_prom
     return text, event
 
 
+def progress_event(request, stage, completed_segments=0, total_segments=1):
+    return {
+        "type": "progress",
+        "request_id": request["request_id"],
+        "task_id": request["task_id"],
+        "stage": stage,
+        "completed_segments": completed_segments,
+        "total_segments": total_segments,
+    }
+
+
 def split_text_into_paragraphs(text, target_chars=70, max_chars=130):
     clean = re.sub(r"\s+", " ", text).strip()
     if not clean:
@@ -735,39 +746,24 @@ def transcribe(request):
         if not model_root.exists():
             raise RuntimeError(f"local ASR model not found: {model_root}")
 
-        emit(
-            {
-                "type": "progress",
-                "request_id": request["request_id"],
-                "task_id": request["task_id"],
-                "stage": "preparing",
-                "completed_segments": 0,
-                "total_segments": 1,
-            }
-        )
+        emit(progress_event(request, "preparing"))
 
         work_dir = output_dir / "audio-segments"
         work_dir.mkdir(parents=True, exist_ok=True)
+        emit(progress_event(request, "normalizing"))
         wav_path = normalize_to_wav(audio_path, work_dir)
+        emit(progress_event(request, "reading_audio"))
         samples, sample_rate = sf.read(wav_path, dtype="float32")
         if samples.ndim > 1:
             samples = samples[:, 0]
+        emit(progress_event(request, "segmenting"))
         speech_intervals = detect_speech_intervals(samples, sample_rate)
         total_speech_sec = round(speech_duration(speech_intervals), 3)
         audio_segments, duration_sec = build_audio_segments(samples, sample_rate)
         if not audio_segments:
             raise RuntimeError("audio segmentation produced no segments")
 
-        emit(
-            {
-                "type": "progress",
-                "request_id": request["request_id"],
-                "task_id": request["task_id"],
-                "stage": "loading",
-                "completed_segments": 0,
-                "total_segments": len(audio_segments),
-            }
-        )
+        emit(progress_event(request, "loading", 0, len(audio_segments)))
 
         from mlx_audio.stt import load
 
@@ -789,16 +785,7 @@ def transcribe(request):
         progress_total = len(audio_segments) * 2
         for segment in audio_segments:
             chunk_path = write_chunk(samples, sample_rate, segment, chunk_dir)
-            emit(
-                {
-                    "type": "progress",
-                    "request_id": request["request_id"],
-                    "task_id": request["task_id"],
-                    "stage": "transcribing",
-                    "completed_segments": segment["index"] - 1,
-                    "total_segments": progress_total,
-                }
-            )
+            emit(progress_event(request, "transcribing", segment["index"] - 1, progress_total))
             text, retry_event = generate_text_with_repetition_retry(
                 model,
                 chunk_path,

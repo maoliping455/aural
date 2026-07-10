@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 public final class ASRWorkerClient {
@@ -61,12 +60,20 @@ public final class ASRWorkerClient {
         process.standardError = stderr
 
         try process.run()
+        AuralChildProcessRegistry.shared.register(process)
+        defer {
+            AuralChildProcessRegistry.shared.unregister(process)
+        }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let eventLogWriter = WorkerEventLogWriter(outputDir: outputDir)
         let outputReader = WorkerEventReader(
             fileHandle: stdout.fileHandleForReading,
             decoder: decoder,
-            onEvent: onEvent
+            onEvent: { event in
+                try? eventLogWriter.append(event)
+                onEvent?(event)
+            }
         )
         let errorReader = PipeReader(fileHandle: stderr.fileHandleForReading)
         outputReader.start()
@@ -79,14 +86,12 @@ public final class ASRWorkerClient {
         case .exited:
             break
         case .cancelled:
-            terminateProcessTree(rootPID: process.processIdentifier)
-            process.waitUntilExit()
+            AuralChildProcessRegistry.shared.terminate(process)
             _ = outputReader.wait()
             _ = errorReader.wait()
             throw ClientError.cancelled(task.id)
         case .timedOut:
-            terminateProcessTree(rootPID: process.processIdentifier)
-            process.waitUntilExit()
+            AuralChildProcessRegistry.shared.terminate(process)
             _ = outputReader.wait()
             let errorData = errorReader.wait()
             let stderrText = String(data: errorData, encoding: .utf8) ?? ""
@@ -159,66 +164,6 @@ public final class ASRWorkerClient {
         return .exited
     }
 
-    private func terminateProcessTree(rootPID: pid_t) {
-        let descendants = descendantProcessIDs(of: rootPID)
-        for pid in descendants.reversed() {
-            Darwin.kill(pid, SIGTERM)
-        }
-        Darwin.kill(rootPID, SIGTERM)
-
-        Thread.sleep(forTimeInterval: 0.4)
-
-        let remaining = descendantProcessIDs(of: rootPID)
-        for pid in remaining.reversed() {
-            Darwin.kill(pid, SIGKILL)
-        }
-        Darwin.kill(rootPID, SIGKILL)
-    }
-
-    private func descendantProcessIDs(of rootPID: pid_t) -> [pid_t] {
-        var result: [pid_t] = []
-        var stack = [rootPID]
-        var seen = Set<pid_t>()
-
-        while let pid = stack.popLast() {
-            guard seen.insert(pid).inserted else {
-                continue
-            }
-            let children = directChildProcessIDs(of: pid)
-            result.append(contentsOf: children)
-            stack.append(contentsOf: children)
-        }
-
-        return result
-    }
-
-    private func directChildProcessIDs(of pid: pid_t) -> [pid_t] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-P", String(pid)]
-
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return []
-        }
-
-        guard process.terminationStatus == 0 else {
-            return []
-        }
-
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        return output
-            .split(whereSeparator: \.isNewline)
-            .compactMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-    }
-
     private func appendWorkerLog(_ text: String, outputDir: URL) throws {
         try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         let logURL = outputDir.appendingPathComponent("error.log")
@@ -231,6 +176,35 @@ public final class ASRWorkerClient {
             try handle.close()
         } else {
             try Data(entry.utf8).write(to: logURL, options: .atomic)
+        }
+    }
+}
+
+private final class WorkerEventLogWriter: @unchecked Sendable {
+    private let logURL: URL
+    private let encoder: JSONEncoder
+    private let lock = NSLock()
+
+    init(outputDir: URL) {
+        self.logURL = outputDir.appendingPathComponent("worker-events.jsonl")
+        self.encoder = JSONEncoder()
+        self.encoder.keyEncodingStrategy = .convertToSnakeCase
+        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        try? Data().write(to: logURL, options: .atomic)
+    }
+
+    func append(_ event: WorkerEvent) throws {
+        let data = try encoder.encode(event) + Data([0x0A])
+        lock.lock()
+        defer { lock.unlock() }
+
+        if FileManager.default.fileExists(atPath: logURL.path),
+           let handle = try? FileHandle(forWritingTo: logURL) {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } else {
+            try data.write(to: logURL, options: .atomic)
         }
     }
 }

@@ -305,9 +305,15 @@ func testTaskStoreLifecycle() throws {
         .appendingPathComponent("transcript.json")
         .path
     failedTask.progressFraction = 0.5
+    failedTask.progressStage = "transcribing"
     try Data("old error".utf8).write(to: URL(fileURLWithPath: requireUnwrapped(failedTask.errorLogPath, "error path")))
     try Data("{\"segments\":[]}".utf8)
         .write(to: URL(fileURLWithPath: requireUnwrapped(failedTask.transcriptPath, "transcript path")))
+    let staleChunkDirectory = store.taskDirectoryURL(for: failedTask.id)
+        .appendingPathComponent("audio-segments/chunks", isDirectory: true)
+    try FileManager.default.createDirectory(at: staleChunkDirectory, withIntermediateDirectories: true)
+    try Data("stale chunk".utf8)
+        .write(to: staleChunkDirectory.appendingPathComponent("chunk-0002.wav"))
     try store.update(failedTask)
 
     let restarted = try store.startTasks(ids: [task.id])
@@ -317,6 +323,7 @@ func testTaskStoreLifecycle() throws {
     require(restartedTask.errorLogPath == nil, "restart should clear error log path")
     require(restartedTask.transcriptPath == nil, "restart should clear transcript path")
     require(restartedTask.progressFraction == nil, "restart should clear progress")
+    require(restartedTask.progressStage == nil, "restart should clear progress stage")
     require(
         !FileManager.default.fileExists(
             atPath: store.taskDirectoryURL(for: task.id).appendingPathComponent("error.log").path
@@ -328,6 +335,12 @@ func testTaskStoreLifecycle() throws {
             atPath: store.taskDirectoryURL(for: task.id).appendingPathComponent("source.m4a").path
         ),
         "restart should keep source audio copy"
+    )
+    require(
+        !FileManager.default.fileExists(
+            atPath: store.taskDirectoryURL(for: task.id).appendingPathComponent("audio-segments").path
+        ),
+        "restart should remove stale audio segment workspace"
     )
 
     try store.deleteTask(id: task.id)
@@ -809,6 +822,21 @@ func testASRWorkerClientTimeoutWritesErrorLog() throws {
     require(errorLog.contains("worker timed out"), "timeout should be written to error log")
 }
 
+func testAuralChildProcessRegistryTerminatesRegisteredProcess() throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    process.arguments = ["30"]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+
+    try process.run()
+    AuralChildProcessRegistry.shared.register(process)
+    require(process.isRunning, "registered process should start running")
+
+    AuralChildProcessRegistry.shared.terminateAll()
+    require(!process.isRunning, "registered process should be terminated")
+}
+
 func testTranscriptionQueueMarksWorkerFailedEventAsFailedTask() throws {
     let root = try makeTemporaryRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1067,8 +1095,12 @@ func testTranscriptionQueuePersistsProgressWhileRunningAndClearsItOnCompletion()
               let progress = runningTask?.progressFraction else {
             return false
         }
-        return abs(progress - 0.25) < 0.0001
+        return abs(progress - 0.25) < 0.0001 && runningTask?.progressStage == "transcribing"
     }
+
+    let eventLogURL = store.taskDirectoryURL(for: task.id).appendingPathComponent("worker-events.jsonl")
+    let eventLog = try String(contentsOf: eventLogURL, encoding: .utf8)
+    require(eventLog.contains("\"stage\":\"transcribing\""), "worker event log should persist progress stage")
 
     try Data("release".utf8).write(to: releaseMarker)
     try waitUntil("progress worker should finish after release marker") {
@@ -1089,6 +1121,7 @@ func testTranscriptionQueuePersistsProgressWhileRunningAndClearsItOnCompletion()
     let completedTask = requireUnwrapped(try store.load().first { $0.id == task.id }, "progress task should exist after completion")
     requireEqual(completedTask.status, .done, "progress task should persist done status")
     require(completedTask.progressFraction == nil, "completed task should clear transient progress")
+    require(completedTask.progressStage == nil, "completed task should clear transient progress stage")
     let transcriptPath = requireUnwrapped(completedTask.transcriptPath, "completed task should keep transcript path")
     let transcript = try TranscriptStore.load(from: URL(fileURLWithPath: transcriptPath))
     requireEqual(transcript.text, "progress done", "completed progress transcript should remain readable")
@@ -1639,6 +1672,7 @@ do {
     try testASRWorkerClientRequiresTerminalEvent()
     try testASRWorkerClientRejectsMalformedWorkerOutput()
     try testASRWorkerClientTimeoutWritesErrorLog()
+    try testAuralChildProcessRegistryTerminatesRegisteredProcess()
     try testTranscriptionQueueMarksWorkerFailedEventAsFailedTask()
     try testTranscriptionQueueMarksMalformedWorkerOutputAsFailedTask()
     try testTranscriptionQueueTreatsInvalidCompletedEventAsFailedTask()

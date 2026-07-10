@@ -20,6 +20,7 @@ public struct TranscriptionTask: Codable, Identifiable, Equatable, Sendable {
     public var transcriptPath: String?
     public var errorLogPath: String?
     public var progressFraction: Double?
+    public var progressStage: String?
 
     public init(
         id: UUID = UUID(),
@@ -35,7 +36,8 @@ public struct TranscriptionTask: Codable, Identifiable, Equatable, Sendable {
         failedAt: Date? = nil,
         transcriptPath: String? = nil,
         errorLogPath: String? = nil,
-        progressFraction: Double? = nil
+        progressFraction: Double? = nil,
+        progressStage: String? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -51,6 +53,7 @@ public struct TranscriptionTask: Codable, Identifiable, Equatable, Sendable {
         self.transcriptPath = transcriptPath
         self.errorLogPath = errorLogPath
         self.progressFraction = progressFraction
+        self.progressStage = progressStage
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -68,6 +71,7 @@ public struct TranscriptionTask: Codable, Identifiable, Equatable, Sendable {
         case transcriptPath
         case errorLogPath
         case progressFraction
+        case progressStage
     }
 
     public init(from decoder: Decoder) throws {
@@ -86,5 +90,6 @@ public struct TranscriptionTask: Codable, Identifiable, Equatable, Sendable {
         self.transcriptPath = try container.decodeIfPresent(String.self, forKey: .transcriptPath)
         self.errorLogPath = try container.decodeIfPresent(String.self, forKey: .errorLogPath)
         self.progressFraction = try container.decodeIfPresent(Double.self, forKey: .progressFraction)
+        self.progressStage = try container.decodeIfPresent(String.self, forKey: .progressStage)
     }
 }

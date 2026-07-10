@@ -22,9 +22,12 @@ public final class TranscriptionQueue {
             return nil
         }
 
+        store.removeGeneratedOutputs(for: task.id)
+
         task.status = .running
         task.startedAt = Date()
         task.progressFraction = 0
+        task.progressStage = nil
         try store.update(task)
 
         let outputDir = store.taskDirectoryURL(for: task.id)
@@ -50,6 +53,7 @@ public final class TranscriptionQueue {
                 latest.failedAt = Date()
                 latest.errorLogPath = failed.errorLogPath
                 latest.progressFraction = nil
+                latest.progressStage = nil
                 try store.update(latest)
                 return latest
             }
@@ -69,6 +73,7 @@ public final class TranscriptionQueue {
                 latest.transcriptPath = nil
                 latest.errorLogPath = ensureFailureLog(outputDir: outputDir, error: error)
                 latest.progressFraction = nil
+                latest.progressStage = nil
                 try store.update(latest)
                 return latest
             }
@@ -77,6 +82,7 @@ public final class TranscriptionQueue {
             latest.transcriptPath = completed.transcriptPath
             latest.durationSec = reconciledDuration(for: latest, workerDuration: completed.durationSec)
             latest.progressFraction = nil
+            latest.progressStage = nil
             try store.update(latest)
             return latest
         } catch ASRWorkerClient.ClientError.cancelled {
@@ -90,6 +96,7 @@ public final class TranscriptionQueue {
             latest.failedAt = Date()
             latest.errorLogPath = ensureFailureLog(outputDir: outputDir, error: error)
             latest.progressFraction = nil
+            latest.progressStage = nil
             try store.update(latest)
             throw error
         }
@@ -211,7 +218,8 @@ private func updateProgress(for taskId: UUID, event: WorkerEvent, store: TaskSto
         return
     }
 
-    let fraction = min(max(Double(completed) / Double(total), 0), 0.99)
+    let rawFraction = min(max(Double(completed) / Double(total), 0), 0.99)
+    let fraction = max(rawFraction, progressFloor(for: event.stage))
     do {
         var tasks = try store.load()
         guard let index = tasks.firstIndex(where: { $0.id == taskId }) else {
@@ -220,9 +228,32 @@ private func updateProgress(for taskId: UUID, event: WorkerEvent, store: TaskSto
         guard tasks[index].status == .running else {
             return
         }
-        tasks[index].progressFraction = fraction
+        let previous = tasks[index].progressFraction ?? 0
+        tasks[index].progressFraction = max(previous, fraction)
+        tasks[index].progressStage = event.stage
         try store.save(tasks)
     } catch {
         // Progress is best-effort; final task state still comes from terminal worker events.
+    }
+}
+
+private func progressFloor(for stage: String?) -> Double {
+    switch stage {
+    case "preparing":
+        return 0.01
+    case "normalizing":
+        return 0.02
+    case "reading_audio":
+        return 0.03
+    case "segmenting":
+        return 0.04
+    case "loading":
+        return 0.05
+    case "transcribing":
+        return 0.06
+    case "aligning":
+        return 0.60
+    default:
+        return 0
     }
 }

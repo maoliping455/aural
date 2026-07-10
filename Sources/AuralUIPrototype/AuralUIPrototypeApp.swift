@@ -4,8 +4,25 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+final class AuralAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AuralChildProcessRegistry.shared.terminateStaleAuralHelpers()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        AuralChildProcessRegistry.shared.terminateAll()
+        return .terminateNow
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AuralChildProcessRegistry.shared.terminateAll()
+    }
+}
+
 @main
 struct AuralUIPrototypeApp: App {
+    @NSApplicationDelegateAdaptor(AuralAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup("") {
             AuralRootView()
@@ -504,6 +521,9 @@ final class AuralAppModel: ObservableObject {
         guard !isPreparingResources else {
             return
         }
+        guard !isRunning else {
+            return
+        }
 
         if let compatibilityStatus = RuntimeCompatibility.blockingStatus() {
             resourceStatus = compatibilityStatus
@@ -613,6 +633,9 @@ final class AuralAppModel: ObservableObject {
         alignmentEnabled: Bool,
         prepareIfNeeded: Bool
     ) {
+        guard !isRunning else {
+            return
+        }
         selectedModelProfile = RuntimeCompatibility.effectiveProfile(profile)
         selectedAlignmentEnabled = alignmentEnabled
         do {
@@ -808,9 +831,22 @@ final class AuralAppModel: ObservableObject {
             return "\(task.status.displayName) 约 \(formatEstimateDuration(estimate))"
         case .running:
             let progress = min(max(task.progressFraction ?? 0, 0), 0.99)
-            return "\(task.status.displayName) \(Int((progress * 100).rounded()))%"
+            return "\(runningStageLabel(task.progressStage)) \(Int((progress * 100).rounded()))%"
         case .paused, .done, .failed:
             return task.status.displayName
+        }
+    }
+
+    private func runningStageLabel(_ stage: String?) -> String {
+        switch stage {
+        case "preparing", "normalizing", "reading_audio", "segmenting":
+            return "准备音频"
+        case "loading":
+            return "加载模型"
+        case "aligning":
+            return "对齐时间戳"
+        default:
+            return TranscriptionStatus.running.displayName
         }
     }
 
@@ -958,6 +994,13 @@ final class AuralAppModel: ObservableObject {
 
     func runQueue() {
         guard resourcesReady else {
+            return
+        }
+        guard ModelResourcePreparer(
+            profile: selectedModelProfile,
+            alignmentEnabled: selectedAlignmentEnabled
+        ).resourcesAreReady() else {
+            refreshLocalResourceState(prepareIfNeeded: true)
             return
         }
         guard !isRunning else {
@@ -1344,6 +1387,8 @@ struct ResourceSettingsView: View {
     }
 
     var body: some View {
+        let isEditable = !model.isRunning && !model.isPreparingResources
+
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 Text("本地转写设置")
@@ -1360,7 +1405,7 @@ struct ResourceSettingsView: View {
                         ModelProfileOptionView(
                             profile: profile,
                             isSelected: profile == draftProfile,
-                            isEnabled: profile.isAvailable(),
+                            isEnabled: isEditable && profile.isAvailable(),
                             onSelect: { draftProfile = profile }
                         )
                     }
@@ -1369,12 +1414,12 @@ struct ResourceSettingsView: View {
 
             AlignmentOptionRow(
                 isEnabled: draftAlignmentEnabled,
-                isInteractive: true,
+                isInteractive: isEditable,
                 onChange: { draftAlignmentEnabled = $0 }
             )
 
             HStack {
-                Text("缺失的资源会在准备时下载，已下载资源会保留并复用。")
+                Text(isEditable ? "缺失的资源会在准备时下载，已下载资源会保留并复用。" : "正在转写时暂不能修改本地模型设置。")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -1388,6 +1433,7 @@ struct ResourceSettingsView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .disabled(!isEditable)
             }
         }
         .padding(24)

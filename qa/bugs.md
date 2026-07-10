@@ -124,3 +124,28 @@
 - 手工验证: 用户在 `Aural-0.1.0-local-verify-20260710-123709.dmg` 上反馈“基本功能没有问题”。
 - 回归建议: 0.1.x 持续收集中文配乐/弱人声开头样例，避免未来重新引入内部短 `chunk_duration` 默认值。
 - 发布判断: 已接受为 0.1.0 release candidate。
+
+## QA-2026-07-10-008: MacBook Air 转写长时间停留在 0%
+
+- 严重级别: Critical
+- 优先级: P0
+- 状态: Fixed, Pending Manual Verification
+- 影响范围: 任务队列、worker 进度、App 退出清理、模型设置并发、重跑任务工作目录
+- 环境: MacBook Air，macOS 15.6.1，Apple Silicon，16GB 内存，notarized `Aural-0.1.0.dmg`
+- 复现步骤:
+  1. 在 MacBook Air 上连续启动两个相同音频任务。
+  2. 观察第二个任务显示 `转写中 0%` 很久。
+  3. 重启 App 或手动检查 `ps axu | grep Aural`。
+- 实际结果: 任务并非完全死锁，但在模型加载和首个 chunk 推理阶段长期显示 0%；历史异常退出后可能留下 worker/helper 进程；恢复任务目录中存在旧 `audio-segments/chunks` 残留，污染下一轮诊断。
+- 预期结果: App 退出或重启不应留下 Aural worker/preparer；每次任务启动前应清理旧生成物；首段推理前应展示可理解的阶段，不应长期看起来卡死；正在转写时不应并发启动模型准备。
+- 现场证据: 用户提供 `/Users/limao/Downloads/aural-air-debug-20260710-141247.zip`。快照中只有一个活跃 `worker_qwen_segmented_bundle.py`，CPU 55%、RSS 约 1GB；`C2C30BF9-D1A9-4FD3-B7C2-FD670F5345A5` 运行 2m37s 仍 `progressFraction=0`，目录有本轮 `normalized.wav` 和 `chunk-0001.wav`，但 `chunk-0002.wav` 时间戳早于本轮 `startedAt`，说明旧工作目录残留参与了现场。
+- 根因判断: 不是模型缓存缺失，也不是多个 worker 当前同时运行。主要是 worker 早期阶段粒度太粗：音频准备、模型加载和首个 chunk 推理前没有可见非零进度；此外 App 缺少统一子进程生命周期管理，恢复/重跑任务没有清理 `audio-segments`，设置页允许转写中触发资源准备。
+- 当前修复:
+  - 新增 `AuralChildProcessRegistry`，worker/preparer 启动后登记；取消、超时、App 退出时杀进程树；App 启动时清理旧 Aural helper。
+  - 每次 pending 任务真正启动前清理 `transcript.json`、`alignment.json`、`error.log`、`worker-events.jsonl` 和 `audio-segments`，只保留 source 音频。
+  - worker 增加 `preparing`、`normalizing`、`reading_audio`、`segmenting`、`loading`、`transcribing` 阶段事件；Swift 队列持久化 `progressStage`，并为早期阶段设置保底进度，避免 UI 长期 0%。
+  - `ASRWorkerClient` 将 worker stdout 事件写入任务目录 `worker-events.jsonl`，便于后续诊断。
+  - 正在转写时禁止保存并准备模型资源；队列启动前重新检查模型资源真实可用。
+- 自动验证证据: `swift build`、`swift run aural-test`、`swift run aural-validate`、`env PYTHONDONTWRITEBYTECODE=1 scripts/validate-segmented-worker.py` 通过。
+- 回归建议: 在 MacBook Air 上安装新的开发验证包，启动两个相同任务，确认第二个任务进入 `加载模型` 或 `转写中` 非 0 阶段；退出 App 后 `ps axu | grep Aural` 不再保留 worker/preparer；重试任务目录不再保留旧 `audio-segments`。
+- 发布判断: 阻塞 0.1.0 正式 GitHub Release。用户手工确认新包后再重新签名、公证和发布。

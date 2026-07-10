@@ -278,6 +278,10 @@ public final class ModelResourcePreparer: @unchecked Sendable {
         let errorReader = DataPipeReader(fileHandle: stderr.fileHandleForReading)
 
         try process.run()
+        AuralChildProcessRegistry.shared.register(process)
+        defer {
+            AuralChildProcessRegistry.shared.unregister(process)
+        }
         eventReader.start()
         errorReader.start()
         process.waitUntilExit()
