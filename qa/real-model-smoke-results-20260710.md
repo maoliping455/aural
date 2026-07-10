@@ -75,9 +75,9 @@ AURAL_MODEL_ROOT="$HOME/Library/Application Support/Aural/Models" \
 
 - 路径：`.build/release/Aural-0.1.0.dmg`
 - 桌面副本：已同步一份本地验证副本
-- Notarization submission：`f1ea5ff4-5c8e-49a5-a0e1-0bde5c217048`
+- Notarization submission：`c4c8b838-e96a-4efe-ad32-71cfa96650ef`
 - 状态：`Accepted`
 - 校验：`hdiutil verify`、`xcrun stapler validate`、Gatekeeper `spctl --assess --type open --context context:primary-signature` 均通过
-- SHA256：`4c3cff8612b52e55e52312c60b83605835359955744f9549ae1c1336b6f05fea`
+- SHA256：`8a784a5dda2cfbaf87684f8ac6b41f0e4fa3d5ac8e359a5319356ca07297e609`
 
-notarized DMG 仍建议做一次覆盖安装和首次打开验证。
+用户已验证最后一版 RC 未发现其他问题，当前 notarized DMG 可作为 0.1.0 GitHub Release 资产。

@@ -100,8 +100,8 @@
 - 崩溃证据: `~/Library/Logs/DiagnosticReports/Aural-2026-07-10-104854.ips` 中 faulting thread 为 0，调用栈包含 `AG::precondition_failure`、`-[NSConcreteTask waitUntilExit]`、`ModelResourcePreparer.probeRuntimeCompatibility()`、`AuralAppModel.refreshLocalResourceState()`、`AuralAppModel.init()`。
 - 当前修复: 资源状态刷新改为先显示 `.checking`，再通过后台 utility task 执行 runtime probe 和模型文件检查，完成后回主线程更新 `resourceStatus`；`prepareLocalResources()` 也避免在主线程同步执行 runtime probe。
 - 自动验证证据: `swift build`、`swift run aural-test`、`swift run aural-validate`、packaged worker smoke、app queue smoke 通过；使用临时 `AURAL_DATA_ROOT` 运行 `.build/release/Aural.app/Contents/MacOS/Aural` 8 秒未崩溃，未生成新的 Aural `.ips`。
-- 发布包: 已重新生成并 notarize `Aural-0.1.0.dmg`，submission id `239a8579-f51e-44d7-b873-f49a6a1e128e`，Gatekeeper `accepted`。
-- 手工验证: 用户在本地验证包上反馈“基本功能没有问题”。正式 notarized DMG 已生成：`.build/release/Aural-0.1.0.dmg`，submission id `f1ea5ff4-5c8e-49a5-a0e1-0bde5c217048`，Gatekeeper `accepted`。
+- 发布包: 最终正式 notarized DMG 已生成：`.build/release/Aural-0.1.0.dmg`，submission id `c4c8b838-e96a-4efe-ad32-71cfa96650ef`，Gatekeeper `accepted`。
+- 手工验证: 用户在本地验证包上反馈“基本功能没有问题”。后续 RC 修复包用户反馈“目前没有发现其他问题”，同意开始制作 release 包并推进发布。
 - 回归建议: 使用 notarized `Aural-0.1.0.dmg` 重新覆盖安装，首次打开应不再出现 crash 弹窗；然后确认资源检查/模型准备界面、第二次打开、已有模型缓存复用均正常。
 - 发布判断: 不阻塞生成 0.1.0 release package；notarized 包交付后保留最终安装验证。
 
