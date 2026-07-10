@@ -114,7 +114,7 @@ private func directChildProcessIDs(of pid: pid_t) -> [pid_t] {
 private func staleAuralHelperProcessIDs() -> [pid_t] {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/ps")
-    process.arguments = ["axo", "pid=,command="]
+    process.arguments = ["axo", "pid=,ppid=,command="]
 
     let stdout = Pipe()
     process.standardOutput = stdout
@@ -134,23 +134,60 @@ private func staleAuralHelperProcessIDs() -> [pid_t] {
     let currentPID = getpid()
     let data = stdout.fileHandleForReading.readDataToEndOfFile()
     let output = String(data: data, encoding: .utf8) ?? ""
-    return output
+    let snapshot = output
         .split(whereSeparator: \.isNewline)
-        .compactMap { line -> pid_t? in
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let separator = trimmed.firstIndex(where: { $0 == " " || $0 == "\t" }) else {
+        .compactMap(parseProcessSnapshotLine)
+    let parentByPID = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.pid, $0.ppid) })
+
+    return snapshot
+        .compactMap { process -> pid_t? in
+            guard process.pid != currentPID else {
                 return nil
             }
-            guard let pid = pid_t(trimmed[..<separator]), pid != currentPID else {
+            guard !hasAncestor(process.pid, ancestorPID: currentPID, parentByPID: parentByPID) else {
                 return nil
             }
-            let command = String(trimmed[separator...])
-            guard command.contains("/Aural.app/Contents/Resources/AuralASRWorker/") else {
+            guard process.command.contains("/Aural.app/Contents/Resources/AuralASRWorker/") else {
                 return nil
             }
-            guard command.contains("worker_qwen") || command.contains("model_resource_prepare.py") else {
+            guard process.command.contains("worker_qwen") || process.command.contains("model_resource_prepare.py") else {
                 return nil
             }
-            return pid
+            return process.pid
         }
+}
+
+private struct ProcessSnapshot {
+    let pid: pid_t
+    let ppid: pid_t
+    let command: String
+}
+
+private func parseProcessSnapshotLine(_ line: Substring) -> ProcessSnapshot? {
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    let parts = trimmed.split(maxSplits: 2, whereSeparator: { $0 == " " || $0 == "\t" })
+    guard parts.count == 3 else {
+        return nil
+    }
+    guard let pid = pid_t(parts[0]), let ppid = pid_t(parts[1]) else {
+        return nil
+    }
+    return ProcessSnapshot(pid: pid, ppid: ppid, command: String(parts[2]))
+}
+
+private func hasAncestor(_ pid: pid_t, ancestorPID: pid_t, parentByPID: [pid_t: pid_t]) -> Bool {
+    var currentPID = pid
+    var seen = Set<pid_t>()
+
+    while let parentPID = parentByPID[currentPID], parentPID > 0 {
+        if parentPID == ancestorPID {
+            return true
+        }
+        guard seen.insert(currentPID).inserted else {
+            return false
+        }
+        currentPID = parentPID
+    }
+
+    return false
 }

@@ -129,7 +129,7 @@
 
 - 严重级别: Critical
 - 优先级: P0
-- 状态: Fixed, Pending Manual Verification
+- 状态: Verified for 0.1.0 RC
 - 影响范围: 任务队列、worker 进度、App 退出清理、模型设置并发、重跑任务工作目录
 - 环境: MacBook Air，macOS 15.6.1，Apple Silicon，16GB 内存，notarized `Aural-0.1.0.dmg`
 - 复现步骤:
@@ -138,7 +138,7 @@
   3. 重启 App 或手动检查 `ps axu | grep Aural`。
 - 实际结果: 任务并非完全死锁，但在模型加载和首个 chunk 推理阶段长期显示 0%；历史异常退出后可能留下 worker/helper 进程；恢复任务目录中存在旧 `audio-segments/chunks` 残留，污染下一轮诊断。
 - 预期结果: App 退出或重启不应留下 Aural worker/preparer；每次任务启动前应清理旧生成物；首段推理前应展示可理解的阶段，不应长期看起来卡死；正在转写时不应并发启动模型准备。
-- 现场证据: 用户提供 `/Users/limao/Downloads/aural-air-debug-20260710-141247.zip`。快照中只有一个活跃 `worker_qwen_segmented_bundle.py`，CPU 55%、RSS 约 1GB；`C2C30BF9-D1A9-4FD3-B7C2-FD670F5345A5` 运行 2m37s 仍 `progressFraction=0`，目录有本轮 `normalized.wav` 和 `chunk-0001.wav`，但 `chunk-0002.wav` 时间戳早于本轮 `startedAt`，说明旧工作目录残留参与了现场。
+- 现场证据: 用户提供 MacBook Air debug zip。快照中只有一个活跃 `worker_qwen_segmented_bundle.py`，CPU 55%、RSS 约 1GB；`C2C30BF9-D1A9-4FD3-B7C2-FD670F5345A5` 运行 2m37s 仍 `progressFraction=0`，目录有本轮 `normalized.wav` 和 `chunk-0001.wav`，但 `chunk-0002.wav` 时间戳早于本轮 `startedAt`，说明旧工作目录残留参与了现场。
 - 根因判断: 不是模型缓存缺失，也不是多个 worker 当前同时运行。主要是 worker 早期阶段粒度太粗：音频准备、模型加载和首个 chunk 推理前没有可见非零进度；此外 App 缺少统一子进程生命周期管理，恢复/重跑任务没有清理 `audio-segments`，设置页允许转写中触发资源准备。
 - 当前修复:
   - 新增 `AuralChildProcessRegistry`，worker/preparer 启动后登记；取消、超时、App 退出时杀进程树；App 启动时清理旧 Aural helper。
@@ -147,5 +147,27 @@
   - `ASRWorkerClient` 将 worker stdout 事件写入任务目录 `worker-events.jsonl`，便于后续诊断。
   - 正在转写时禁止保存并准备模型资源；队列启动前重新检查模型资源真实可用。
 - 自动验证证据: `swift build`、`swift run aural-test`、`swift run aural-validate`、`env PYTHONDONTWRITEBYTECODE=1 scripts/validate-segmented-worker.py` 通过。
-- 回归建议: 在 MacBook Air 上安装新的开发验证包，启动两个相同任务，确认第二个任务进入 `加载模型` 或 `转写中` 非 0 阶段；退出 App 后 `ps axu | grep Aural` 不再保留 worker/preparer；重试任务目录不再保留旧 `audio-segments`。
-- 发布判断: 阻塞 0.1.0 正式 GitHub Release。用户手工确认新包后再重新签名、公证和发布。
+- 手工验证: 用户在 `Aural-0.1.0-dev-ui-hang-20260710-163545.dmg` 上反馈“目前没有发现其他问题”，同意开始制作 release 包并推进发布。
+- 回归建议: 在后续 0.1.x 继续覆盖 MacBook Air 双任务、退出后残留进程、重试任务目录清理和早期阶段进度显示。
+- 发布判断: 已接受为 0.1.0 release candidate。
+
+## QA-2026-07-10-009: 导入任务后 App 鼠标转圈且无响应
+
+- 严重级别: Critical
+- 优先级: P0
+- 状态: Verified for 0.1.0 RC
+- 影响范围: App 启动、残留 worker 清理、批量任务导入后的主线程响应
+- 环境: macOS，本地安装开发验证包后批量拖入多个 wav 任务
+- 复现步骤:
+  1. 安装 `Aural-0.1.0-dev-zero-progress-20260710-160750.dmg`。
+  2. 批量拖入多个 wav 任务。
+  3. 等待任务开始执行或部分完成。
+  4. 观察鼠标持续转圈，App 窗口无响应。
+- 实际结果: worker 任务可以继续完成，但 App 主线程卡住，界面无法响应。
+- 预期结果: 启动残留进程清理不应阻塞 AppKit/SwiftUI 主线程；导入和执行任务期间窗口应保持可操作。
+- 现场证据: `sample` 采样显示主线程停在 `AuralAppDelegate.applicationDidFinishLaunching(_:) -> AuralChildProcessRegistry.terminateStaleAuralHelpers() -> staleAuralHelperProcessIDs() -> Process.waitUntilExit()`。
+- 根因: `applicationDidFinishLaunching` 同步执行残留 Aural helper 清理；清理内部调用 `/bin/ps` 并 `waitUntilExit()`，导致启动通知和 UI 事件处理被阻塞。
+- 当前修复: 启动残留 helper 清理改为后台 utility queue 执行；`ps` 快照改为读取 `pid/ppid/command`，并排除当前 App 进程的后代，避免异步清理和新启动 worker 之间发生竞态误杀。
+- 手工验证: 用户在 `Aural-0.1.0-dev-ui-hang-20260710-163545.dmg` 上反馈“目前没有发现其他问题”，同意开始制作 release 包并推进发布。
+- 回归建议: 后续 0.1.x 继续覆盖批量拖入 5 个以上 wav、任务执行期间窗口响应、退出后 worker/preparer 清理，以及 MainActor 同步 IO 卡顿优化。
+- 发布判断: 已接受为 0.1.0 release candidate。

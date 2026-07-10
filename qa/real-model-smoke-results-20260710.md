@@ -74,7 +74,7 @@ AURAL_MODEL_ROOT="$HOME/Library/Application Support/Aural/Models" \
 已生成 notarized DMG：
 
 - 路径：`.build/release/Aural-0.1.0.dmg`
-- 桌面副本：`/Users/limao/Desktop/Aural-0.1.0.dmg`
+- 桌面副本：已同步一份本地验证副本
 - Notarization submission：`f1ea5ff4-5c8e-49a5-a0e1-0bde5c217048`
 - 状态：`Accepted`
 - 校验：`hdiutil verify`、`xcrun stapler validate`、Gatekeeper `spctl --assess --type open --context context:primary-signature` 均通过

@@ -6,7 +6,9 @@ import UniformTypeIdentifiers
 
 final class AuralAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AuralChildProcessRegistry.shared.terminateStaleAuralHelpers()
+        DispatchQueue.global(qos: .utility).async {
+            AuralChildProcessRegistry.shared.terminateStaleAuralHelpers()
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
