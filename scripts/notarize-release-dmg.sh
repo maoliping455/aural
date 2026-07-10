@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION="${AURAL_CONFIGURATION:-release}"
 RELEASE_DIR="${AURAL_RELEASE_DIR:-$ROOT_DIR/.build/$CONFIGURATION}"
 NOTARYTOOL_PROFILE="${AURAL_NOTARYTOOL_PROFILE:-AuralNotaryProfile}"
+VERSION="${AURAL_RELEASE_VERSION:-0.1.0}"
 
 if [[ $# -gt 1 ]]; then
   echo "usage: scripts/notarize-release-dmg.sh [path/to/Aural.dmg]" >&2
@@ -14,20 +15,25 @@ fi
 if [[ $# -eq 1 ]]; then
   DMG_PATH="$1"
 else
-  shopt -s nullglob
-  candidates=("$RELEASE_DIR"/Aural-0.1.0-*.dmg)
-  shopt -u nullglob
-  if [[ "${#candidates[@]}" -eq 0 ]]; then
-    echo "No release DMG found in $RELEASE_DIR" >&2
-    echo "Run scripts/package-local-dmg.sh first." >&2
-    exit 1
-  fi
-  DMG_PATH="${candidates[0]}"
-  for candidate in "${candidates[@]}"; do
-    if [[ "$candidate" -nt "$DMG_PATH" ]]; then
-      DMG_PATH="$candidate"
+  stable_candidate="$RELEASE_DIR/Aural-$VERSION.dmg"
+  if [[ -f "$stable_candidate" ]]; then
+    DMG_PATH="$stable_candidate"
+  else
+    shopt -s nullglob
+    candidates=("$RELEASE_DIR"/Aural-"$VERSION"-*.dmg)
+    shopt -u nullglob
+    if [[ "${#candidates[@]}" -eq 0 ]]; then
+      echo "No release DMG found in $RELEASE_DIR" >&2
+      echo "Run scripts/package-local-dmg.sh first." >&2
+      exit 1
     fi
-  done
+    DMG_PATH="${candidates[0]}"
+    for candidate in "${candidates[@]}"; do
+      if [[ "$candidate" -nt "$DMG_PATH" ]]; then
+        DMG_PATH="$candidate"
+      fi
+    done
+  fi
 fi
 
 if [[ ! -f "$DMG_PATH" ]]; then
@@ -49,6 +55,6 @@ xcrun notarytool submit "$DMG_PATH" \
 
 xcrun stapler staple "$DMG_PATH"
 xcrun stapler validate "$DMG_PATH"
-spctl --assess --type open --verbose=4 "$DMG_PATH"
+spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
 
 echo "$DMG_PATH"

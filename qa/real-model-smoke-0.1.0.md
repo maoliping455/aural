@@ -169,12 +169,12 @@ scripts/smoke-app-queue-bundle.sh
 
 - 使用 ignored `work/chunk-hallucination/` 中已有 bad-case 回归资料。
 - 只记录统计结果、命令和结论，不把原始音频、私有 transcript 或本机路径提交到仓库。
-- 默认 4bit 策略必须包含 `chunk_duration=30s`、`repetition_penalty=1.10`、`repetition_context_size=32`。
+- 默认 4bit 策略必须包含首轮不传内部 `chunk_duration`、首轮 `repetition_penalty=1.0`，并在 hard repetition signal 命中时记录 `retry_repetition_penalty=1.10`、`retry_repetition_context_size=32`。
 
 通过标准：
 
 - `asr_repetition_with_alignment_reject` 类 case 不再出现 hard repetition。
-- transcript metadata 记录当前 ASR generate 参数。
+- transcript metadata 记录当前 ASR generate 参数和 dynamic retry 触发/采纳情况。
 - 若仍出现大段重复、明显幻听、整段漏转或任务成功但 transcript 无有效文本，标记 P0 并阻塞发布候选。
 
 ## 5. 跳过规则

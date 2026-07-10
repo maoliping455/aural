@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,12 +14,16 @@ from itn_postprocess import apply_itn_to_transcript
 
 
 RESOURCES_ROOT = Path(__file__).resolve().parents[1]
-# Qwen3-ASR can fall into stable repetition loops on some ~40s+ long-form speech chunks.
-# Keep the model's internal decode window short even in the direct worker path.
-ASR_GENERATE_CHUNK_DURATION_SEC = 30.0
+# Keep the first model pass un-split inside mlx_audio. The outer worker owns chunking.
+ASR_GENERATE_CHUNK_DURATION_SEC = None
 ASR_GENERATE_MAX_TOKENS = 8192
-ASR_GENERATE_REPETITION_PENALTY = 1.10
+ASR_GENERATE_REPETITION_PENALTY = 1.0
 ASR_GENERATE_REPETITION_CONTEXT_SIZE = 32
+ASR_GENERATE_RETRY_CHUNK_DURATION_SEC = None
+ASR_GENERATE_RETRY_REPETITION_PENALTY = 1.10
+ASR_GENERATE_RETRY_REPETITION_CONTEXT_SIZE = 32
+ASR_REPETITION_SIGNAL_MIN_COUNT = 8
+ASR_REPETITION_SIGNAL_MIN_COVERAGE = 0.35
 ASR_MODEL_DIRECTORIES = {
     "fast": "qwen3-asr-0.6b-4bit",
     "balanced": "qwen3-asr-1.7b-4bit",
@@ -133,6 +138,13 @@ def env_int(name, default):
     return int(value)
 
 
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "none"}
+
+
 def default_repetition_penalty():
     profile = os.environ.get("AURAL_MODEL_PROFILE", "balanced")
     if profile == "accurate":
@@ -143,13 +155,32 @@ def default_repetition_penalty():
 def asr_generate_settings():
     penalty = env_float("AURAL_ASR_REPETITION_PENALTY", default_repetition_penalty())
     context_size = env_int("AURAL_ASR_REPETITION_CONTEXT_SIZE", ASR_GENERATE_REPETITION_CONTEXT_SIZE)
+    retry_penalty = env_float(
+        "AURAL_ASR_REPETITION_RETRY_PENALTY",
+        ASR_GENERATE_RETRY_REPETITION_PENALTY,
+    )
+    retry_chunk_duration_sec = env_float(
+        "AURAL_ASR_REPETITION_RETRY_CHUNK_DURATION_SEC",
+        ASR_GENERATE_RETRY_CHUNK_DURATION_SEC,
+    )
+    retry_context_size = env_int(
+        "AURAL_ASR_REPETITION_RETRY_CONTEXT_SIZE",
+        ASR_GENERATE_RETRY_REPETITION_CONTEXT_SIZE,
+    )
     if penalty is None:
         context_size = None
+    if retry_penalty is None:
+        retry_context_size = None
     return {
         "chunk_duration_sec": ASR_GENERATE_CHUNK_DURATION_SEC,
         "max_tokens": ASR_GENERATE_MAX_TOKENS,
         "repetition_penalty": penalty,
         "repetition_context_size": context_size,
+        "repetition_retry_enabled": env_bool("AURAL_ASR_REPETITION_RETRY", True)
+        and retry_penalty is not None,
+        "retry_chunk_duration_sec": retry_chunk_duration_sec,
+        "retry_repetition_penalty": retry_penalty,
+        "retry_repetition_context_size": retry_context_size,
     }
 
 
@@ -189,11 +220,55 @@ def collapse_repeated_sentences(text, min_run=4, keep=1):
     return "".join(result), {"changed": True, "removed_repetitions": removed}
 
 
-def generate_one(model, audio_path, language):
+def normalized_chars(text):
+    return "".join(
+        re.findall(r"[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff]+", str(text or ""))
+    ).lower()
+
+
+def repeated_ngram_signal(text, min_len=1, max_len=8):
+    norm = normalized_chars(text)
+    if len(norm) < 24:
+        return {"phrase": "", "count": 0, "coverage": 0.0, "score": 0.0}
+
+    best = {"phrase": "", "count": 0, "coverage": 0.0, "score": 0.0}
+    for width in range(min_len, min(max_len, len(norm)) + 1):
+        grams = Counter(norm[index : index + width] for index in range(0, len(norm) - width + 1, width))
+        for phrase, count in grams.most_common(8):
+            if count < ASR_REPETITION_SIGNAL_MIN_COUNT:
+                continue
+            coverage = len(phrase) * count / max(len(norm), 1)
+            score = coverage * min(len(phrase), 4)
+            if score > best["score"]:
+                best = {
+                    "phrase": phrase[:40],
+                    "count": count,
+                    "coverage": round(coverage, 4),
+                    "score": round(score, 4),
+                }
+    return best
+
+
+def is_repetition_loop(signal):
+    return bool(
+        signal.get("coverage", 0.0) >= ASR_REPETITION_SIGNAL_MIN_COVERAGE
+        and signal.get("count", 0) >= ASR_REPETITION_SIGNAL_MIN_COUNT
+    )
+
+
+def retry_generate_settings(settings):
+    retry_settings = dict(settings)
+    retry_settings["chunk_duration_sec"] = settings["retry_chunk_duration_sec"]
+    retry_settings["repetition_penalty"] = settings["retry_repetition_penalty"]
+    retry_settings["repetition_context_size"] = settings["retry_repetition_context_size"]
+    return retry_settings
+
+
+def generate_one(model, audio_path, language, settings=None):
     signature = inspect.signature(model.generate)
-    settings = asr_generate_settings()
+    settings = settings or asr_generate_settings()
     kwargs = {"max_tokens": settings["max_tokens"], "verbose": False}
-    if "chunk_duration" in signature.parameters:
+    if settings["chunk_duration_sec"] is not None and "chunk_duration" in signature.parameters:
         kwargs["chunk_duration"] = settings["chunk_duration_sec"]
     if settings["repetition_penalty"] is not None and "repetition_penalty" in signature.parameters:
         kwargs["repetition_penalty"] = settings["repetition_penalty"]
@@ -208,6 +283,38 @@ def generate_one(model, audio_path, language):
     if "audio" in signature.parameters:
         return model.generate(audio=str(audio_path), **kwargs)
     return model.generate(str(audio_path), **kwargs)
+
+
+def generate_text_with_repetition_retry(model, audio_path, language, settings=None):
+    settings = settings or asr_generate_settings()
+    result = generate_one(model, audio_path, language, settings=settings)
+    text = clean_asr_template_artifacts(output_text(result))
+    if not text:
+        return text, None
+
+    initial_signal = repeated_ngram_signal(text)
+    if not settings["repetition_retry_enabled"] or not is_repetition_loop(initial_signal):
+        return text, None
+
+    retry_settings = retry_generate_settings(settings)
+    retry_result = generate_one(model, audio_path, language, settings=retry_settings)
+    retry_text = clean_asr_template_artifacts(output_text(retry_result))
+    retry_signal = repeated_ngram_signal(retry_text)
+    accepted = bool(
+        retry_text
+        and (
+            not is_repetition_loop(retry_signal)
+            or retry_signal.get("score", 0.0) < initial_signal.get("score", 0.0)
+        )
+    )
+    event = {
+        "initial_signal": initial_signal,
+        "retry_signal": retry_signal,
+        "accepted_retry": accepted,
+    }
+    if accepted:
+        return retry_text, event
+    return text, event
 
 
 def split_text_into_paragraphs(text, target_chars=55, max_chars=110):
@@ -379,8 +486,13 @@ def transcribe(request):
         )
 
         language = normalize_language(request.get("language") or "auto")
-        result = generate_one(model, audio_path, language)
-        text = clean_asr_template_artifacts(output_text(result))
+        result_text, retry_event = generate_text_with_repetition_retry(
+            model,
+            audio_path,
+            language,
+            settings=generate_settings,
+        )
+        text = result_text
         if not text:
             raise RuntimeError("asr runtime produced empty transcript")
         text, cleanup = collapse_repeated_sentences(text)
@@ -399,10 +511,22 @@ def transcribe(request):
                 "timestamp_method": "text_length_proportional",
                 "load_sec": load_sec,
                 "asr_generate": {
+                    "mode": "dynamic_repetition_retry",
                     "chunk_duration_sec": generate_settings["chunk_duration_sec"],
                     "max_tokens": generate_settings["max_tokens"],
                     "repetition_penalty": generate_settings["repetition_penalty"],
                     "repetition_context_size": generate_settings["repetition_context_size"],
+                    "retry_on_repetition": generate_settings["repetition_retry_enabled"],
+                    "retry_chunk_duration_sec": generate_settings["retry_chunk_duration_sec"],
+                    "retry_repetition_penalty": generate_settings["retry_repetition_penalty"],
+                    "retry_repetition_context_size": generate_settings["retry_repetition_context_size"],
+                },
+                "asr_repetition_retry": {
+                    "enabled": generate_settings["repetition_retry_enabled"],
+                    "trigger_rule": "ngram_coverage>=0.35_and_count>=8",
+                    "triggered_chunk_count": 1 if retry_event else 0,
+                    "accepted_retry_count": 1 if retry_event and retry_event["accepted_retry"] else 0,
+                    "events": [retry_event] if retry_event else [],
                 },
                 "asr_cleanup": {
                     "enabled": True,

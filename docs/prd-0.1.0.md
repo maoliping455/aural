@@ -325,8 +325,9 @@ scripts/build-local-app.sh --include-runtime \
 AURAL_RUNTIME_MIN_MACOS=14.0 scripts/audit-runtime-compatibility.sh .build/release/Aural.app
 codesign --verify --deep --strict --verbose=2 .build/release/Aural.app
 spctl --assess --type execute --verbose=4 .build/release/Aural.app
+AURAL_DMG_OUTPUT=.build/release/Aural-0.1.0.dmg \
 scripts/package-local-dmg.sh
-scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0-<timestamp>.dmg
+scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0.dmg
 ```
 
 ### 手工门槛

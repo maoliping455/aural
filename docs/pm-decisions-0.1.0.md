@@ -19,7 +19,7 @@
 | D1 | 主线目录 | 使用 `aural-open-source` | 建议采用 | 影响后续开发、QA 和发布归档 |
 | D2 | 发布包形态 | 轻量 DMG + 首次下载模型 | 建议采用 | 影响打包、安装、README、模型准备 QA |
 | D3 | 默认转写配置 | 平衡 + 字幕时间戳对齐 | 建议采用 | 影响首启资源大小、默认质量和播放体验 |
-| D4 | ITN FST | 不把缺失 FST 作为 0.1.0 P0，但必须说明 fallback | 待确认 | 影响中文归一化质量和验证脚本 |
+| D4 | ITN FST | 不把缺失 FST 作为 0.1.0 P0；作为低优先级优化暂不排期 | 已确认 | 影响中文归一化质量和验证脚本，但不阻塞首发 |
 | D5 | notarization | 0.1.0 公开发布必须 Developer ID signed + notarized | 已确认 | 阻塞公开发布包 |
 | D6 | 真实模型 smoke | 发布前必须跑最小 smoke 集 | 建议采用 | 影响是否能证明真实 ASR 链路可用 |
 | D7 | ASR 质量底线 | 严重重复/幻听作为 release blocker；raw ASR 重复循环必须闭环 | 已确认 | 阻塞发布候选验收 |
@@ -95,22 +95,23 @@
 
 ## D4：ITN FST 发布策略
 
-建议结论：不把缺失 ITN FST 自动定义为 0.1.0 P0 blocker，但必须在 release 和 QA 口径中说明 fallback；如果产品要求中文归一化体验稳定，则升级为 P0。
+确认结论：不把缺失 ITN FST 定义为 0.1.0 P0 blocker；ITN 优化作为低优先级优化项目记录，暂不排期。
 
 当前事实：
 
 - QA 记录显示 `validate-itn-postprocess.py` 在缺少 `zh/itn/tagger_no_standalone.fst` 时失败。
 - 当前主链路可以在没有完整 ITN FST 时回退 raw/基础文本，但中文日期、手机号、英文缩写等归一化质量会受影响。
 
-建议口径：
+发布口径：
 
-- 若 0.1.0 定位为“可用的本地转写首发版”，ITN 可作为 P1，不阻塞主链路发布。
-- 若 0.1.0 对外承诺“中文格式归一化稳定”，ITN FST 必须升级为 P0，发布前补齐并验证。
+- 0.1.0 定位为“可用的本地转写首发版”，不承诺中文格式归一化稳定。
+- 缺失 FST 时保留 raw/基础文本，不阻塞主链路发布。
+- 后续如重新排期 ITN，需要补齐 FST 来源、许可证、打包方式和 `validate-itn-postprocess.py` 回归。
 
-需要确认：
+后续记录：
 
-- ITN FST 是否是 0.1.0 发布阻塞项。
-- 如果不是，README / release notes 是否需要明确“部分格式归一化仍在优化”。
+- ITN 优化暂不排期。
+- README / release notes 如提到中文格式归一化，应说明部分格式归一化仍在优化。
 
 ## D5：notarization
 
@@ -165,8 +166,8 @@
 
 - 根因不在 UI、ITN、导出或 forced alignment，而在 Qwen3-ASR 长音频解码阶段的 repetition loop。
 - 已有公开安全摘要见 `docs/research/asr-repetition-root-cause-0.1.0.md`。
-- 默认 4bit 策略应使用 30s generate window、`repetition_penalty=1.10` 和 `repetition_context_size=32`。
-- 当前默认策略已在 18 个历史 raw ASR bad-case 上回归 `bad=0`，direct/app queue 真实模型 smoke 通过；后续新增 hard repetition case 仍按 P0 重新打开。
+- 默认 4bit 策略应只使用 Aural 外层 60/90s chunking，首轮不传内部 `chunk_duration`，并使用 neutral `repetition_penalty=1.0`；当 chunk 命中 hard repetition signal 时，再用 `repetition_penalty=1.10` 和 `repetition_context_size=32` 重试。
+- 固定 `1.10` 旧策略曾在 18 个历史 raw ASR bad-case 上回归 `bad=0`；动态 retry 策略需要重新补跑历史 bad-case 和 direct/app queue 真实模型 smoke，完成前仍作为 P0 gate。
 
 建议分级：
 
@@ -239,7 +240,7 @@
 1. D1 主线目录。
 2. D2 发布包形态。
 3. D3 默认转写配置。
-4. D4 ITN FST 是否阻塞。
+4. D4 ITN FST 已确认不阻塞，后续作为低优先级优化。
 5. D5 / Action A-001：Developer ID 证书和 notarytool keychain profile 在 release 机器就绪。
 6. D6 真实模型 smoke 最小集。
 7. D7 raw ASR bad-case 回归和真实模型 smoke 是否已通过。

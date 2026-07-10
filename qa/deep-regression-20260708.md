@@ -37,7 +37,7 @@ Swift：Apple Swift 6.3.3，Target `arm64-apple-macosx26.0`
 
 真实模型 app queue smoke 的功能路径通过：正常音频转写完成，坏音频进入失败路径并生成 `error.log`。但脚本最终 `codesign --verify --deep --strict` 失败，且独立复验同样失败，因此当前 `.build/release/Aural.app` 不能作为 release app 放行。发布前需要重新生成/签名 release app，并复跑 app queue smoke 与 codesign。
 
-ITN 条件回归失败原因明确：bundle 中缺少 `custom_wetext_fsts/zh/itn/tagger_no_standalone.fst`。若 0.1.0 发布要求包含 ITN，则该项阻塞；若 ITN 不在本次发布范围，则应作为已知资源/打包缺口记录。
+ITN 条件回归失败原因明确：bundle 中缺少 `custom_wetext_fsts/zh/itn/tagger_no_standalone.fst`。后续 PM 已确认该项不阻塞 0.1.0，作为低优先级优化暂不排期；当前版本接受 raw/基础文本 fallback。
 
 ## 自动验证结果
 
@@ -109,7 +109,7 @@ Smoke 产物摘要：
 
 - P0/Release blocker：当前 `.build/release/Aural.app` codesign 严格校验失败。
 - P1：app queue smoke 首次遇到 `.build` 并发/瞬态缺失 runtime 的失败；多 agent 共享工作树时建议串行 release/smoke 构建步骤。
-- P1/P2 取决于发布范围：ITN FST 缺失；若 ITN 是 0.1.0 必需能力则阻塞，否则作为已知缺口。
+- P3：ITN FST 缺失；PM 已确认不阻塞 0.1.0，作为低优先级优化暂不排期。
 - 未覆盖：视频抽音频 e2e、英文短音频、aligner 缺失/损坏 fallback、notarized DMG。
 
 ## Project Lead 复验补充

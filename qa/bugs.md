@@ -15,9 +15,9 @@
 
 ## QA-2026-07-08-002: ITN 验证在缺少中文 FST 规则时无法完成日期和手机号归一化
 
-- 严重级别: Major
-- 优先级: P1
-- 状态: New
+- 严重级别: Minor
+- 优先级: P3
+- 状态: Deferred
 - 影响范围: `scripts/validate-itn-postprocess.py`、打包后的 `custom_wetext_fsts`
 - 环境: `.build/release/Aural.app/Contents/Resources/runtime/bin/python3`
 - 复现步骤: 运行 `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-itn-postprocess.py`
@@ -26,6 +26,7 @@
 - 证据: 本轮命令确认 `custom_wetext_fsts` 下只有 `.keep`
 - 最小复现: `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-itn-postprocess.py`
 - 回归建议: 使用带 `--itn-fst-source /path/to/custom-wetext-fsts` 的 bundle 重新运行该脚本，并补跑 `scripts/audit-open-source.sh`
+- 发布判断: 不阻塞 0.1.0。当前版本接受 raw/基础文本 fallback；ITN 优化作为低优先级项目记录，暂不排期。
 
 ## QA-2026-07-08-003: Swift Package 缺少轻量测试入口
 
@@ -44,24 +45,24 @@
 
 - 严重级别: Critical
 - 优先级: P0
-- 状态: Verified
+- 状态: Accepted for 0.1.0 RC
 - 影响范围: `AuralASRWorker/worker_qwen_segmented_bundle.py`、`AuralASRWorker/worker_qwen_direct_bundle.py`、真实模型 smoke、ASR 质量回归
 - 环境: Apple Silicon macOS，本地 Qwen3-ASR 4bit 模型，长口语音频 chunk
 - 复现步骤: 使用已有 bad-case 回归集中 `asr_repetition_with_alignment_reject` 类 chunk 运行默认 4bit worker
 - 实际结果: 旧策略下部分 chunk 会在 raw ASR 阶段进入 repetition loop，表现为单字、短词或短句大面积重复，可能打满 `max_tokens`
 - 预期结果: 默认 4bit 策略不应输出 hard repetition；若模型仍进入异常循环，必须被 bad-case 回归捕获并阻塞发布
 - 根因: Qwen3-ASR 长音频解码阶段 repetition loop，不是 UI、ITN、导出或 forced alignment 造成；公开摘要见 `docs/research/asr-repetition-root-cause-0.1.0.md`
-- 当前修复: 默认 4bit ASR 生成使用 30s generate window、`repetition_penalty=1.10`、`repetition_context_size=32`；参数写入 transcript metadata；direct/segmented validation 覆盖参数传递
-- 验证证据: `work/chunk-hallucination/results/v0_1_0_default_4bit.md` 记录 18 个 `asr_repetition_with_alignment_reject` bad-case 在当前默认策略下 `bad=0`、`bad_rate=0.0%`、最大重复覆盖率 0.0849；最新 `scripts/smoke-direct-bundle-worker.sh` 和 `scripts/smoke-app-queue-bundle.sh` 通过，transcript metadata 写入 `chunk_duration_sec=30.0`、`repetition_penalty=1.1`、`repetition_context_size=32`
+- 当前修复: 默认 4bit ASR 首轮不传内部 `chunk_duration`，只使用 Aural 外层 60/90s chunking；首轮 neutral `repetition_penalty=1.0`。当 chunk 输出命中 hard repetition signal 时，自动用 `repetition_penalty=1.10`、`repetition_context_size=32` 重试该 chunk，并将 retry 触发和采纳结果写入 transcript metadata。
+- 验证证据: 2026-07-08 固定 `repetition_penalty=1.10` 策略曾在 18 个 `asr_repetition_with_alignment_reject` bad-case 上回归 `bad=0`。2026-07-10 当前策略已通过 direct/segmented validation，覆盖首轮 `1.0`、异常重复触发 `1.10` retry、采纳非重复 retry 文本；当前 `.build/release/Aural.app` 的 direct worker smoke、app queue + alignment on、app queue + alignment off、坏音频失败路径均通过，metadata 写入 `chunk_duration_sec=null`、`repetition_penalty=1.0`、`retry_repetition_penalty=1.1`。历史 hard repetition case 未重新完整批量回放，作为 0.1.x 持续回归集继续维护。
 - 最小复现: 使用 ignored `work/chunk-hallucination/` 中的 bad-case 回归资料，不将原始音频或 transcript 提交到仓库
 - 回归建议: 运行 `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-direct-segments.py`、`env PYTHONDONTWRITEBYTECODE=1 scripts/validate-segmented-worker.py`、已有 raw ASR bad-case 回归脚本、`scripts/smoke-direct-bundle-worker.sh` 和 `scripts/smoke-app-queue-bundle.sh`
-- 发布判断: 当前 blocker 已按默认 4bit 策略验证关闭；后续若新增 hard repetition case，重新打开 P0
+- 发布判断: 已接受为 0.1.0 release candidate；若后续新增 hard repetition case，重新打开 P0 并补充到回归集。
 
 ## QA-2026-07-08-005: 播放中重命名中文输入被刷新打断且滚动卡顿
 
 - 严重级别: Major
 - 优先级: P1
-- 状态: Ready for Manual Verification
+- 状态: Verified for 0.1.0 RC
 - 影响范围: `Sources/AuralUIPrototype/AuralUIPrototypeApp.swift`，任务列表 rename、播放进度刷新、任务列表/详情滚动
 - 环境: macOS SwiftUI App，播放音频时，中文输入法重命名任务
 - 复现步骤:
@@ -77,5 +78,49 @@
 - QA 复核: 子 agent 只读复核认为当前 diff 合理覆盖两个症状；残余风险集中在超长 transcript/alignment 的高亮计算、首次读取 transcript 失败后的缓存失败状态、以及真实 macOS 中文输入法 marked text 行为必须实机验证。
 - 自动验证证据: `swift build`、`swift run aural-test`、`swift run aural-validate`、`scripts/audit-open-source.sh` 均通过；本地验证 DMG 已生成并通过 `hdiutil verify`。
 - 工作流记录: `work/checkpoints/2026-07-08-playback-rename-scroll.md`
-- 回归建议: 手工验证播放中中文重命名、右侧标题重命名、任务列表滚动、详情转写滚动、seek/双击跳转/回到正在播放按钮，以及后台仍有任务运行时的中文重命名。
-- 发布判断: 若播放中无法稳定重命名或滚动明显卡顿，阻塞 v0.1.0 用户体验验收。
+- 手工验证: 用户在 `Aural-0.1.0-local-verify-20260710-123709.dmg` 上反馈“基本功能没有问题”。
+- 回归建议: 后续 0.1.x 继续覆盖播放中中文重命名、右侧标题重命名、任务列表滚动、详情转写滚动、seek/双击跳转/回到正在播放按钮，以及后台仍有任务运行时的中文重命名。
+- 发布判断: 已接受为 0.1.0 release candidate。
+
+## QA-2026-07-10-006: 重装后首次打开 Aural 意外退出，第二次打开正常
+
+- 严重级别: Critical
+- 优先级: P0
+- 状态: Ready for Notarized Package Verification
+- 影响范围: 首次启动、资源检查、Developer ID notarized DMG 安装后首次打开
+- 环境: macOS 26.2，`/Applications/Aural.app`，notarized `Aural-0.1.0.dmg`
+- 复现步骤:
+  1. 使用 `Aural-0.1.0.dmg` 安装或覆盖安装到 Applications。
+  2. 首次打开 Aural。
+  3. 观察 macOS crash 弹窗。
+  4. 再次打开 Aural。
+- 实际结果: 首次打开出现 “Aural 意外退出”，重新打开后正常。
+- 预期结果: 首次打开不应崩溃；若资源需要检查或下载，应稳定显示资源准备界面。
+- 根因: `AuralAppModel.init()` 在 SwiftUI `StateObject` 安装期间同步调用 `refreshLocalResourceState()`，随后在主线程执行 `ModelResourcePreparer.probeRuntimeCompatibility()` 内的 `Process.waitUntilExit()`。首次启动时 AppKit/SwiftUI 启动通知重入，触发 AttributeGraph `AG::precondition_failure` 并 `SIGABRT`。
+- 崩溃证据: `~/Library/Logs/DiagnosticReports/Aural-2026-07-10-104854.ips` 中 faulting thread 为 0，调用栈包含 `AG::precondition_failure`、`-[NSConcreteTask waitUntilExit]`、`ModelResourcePreparer.probeRuntimeCompatibility()`、`AuralAppModel.refreshLocalResourceState()`、`AuralAppModel.init()`。
+- 当前修复: 资源状态刷新改为先显示 `.checking`，再通过后台 utility task 执行 runtime probe 和模型文件检查，完成后回主线程更新 `resourceStatus`；`prepareLocalResources()` 也避免在主线程同步执行 runtime probe。
+- 自动验证证据: `swift build`、`swift run aural-test`、`swift run aural-validate`、packaged worker smoke、app queue smoke 通过；使用临时 `AURAL_DATA_ROOT` 运行 `.build/release/Aural.app/Contents/MacOS/Aural` 8 秒未崩溃，未生成新的 Aural `.ips`。
+- 发布包: 已重新生成并 notarize `Aural-0.1.0.dmg`，submission id `239a8579-f51e-44d7-b873-f49a6a1e128e`，Gatekeeper `accepted`。
+- 手工验证: 用户在本地验证包上反馈“基本功能没有问题”。正式 notarized DMG 已生成：`.build/release/Aural-0.1.0.dmg`，submission id `f1ea5ff4-5c8e-49a5-a0e1-0bde5c217048`，Gatekeeper `accepted`。
+- 回归建议: 使用 notarized `Aural-0.1.0.dmg` 重新覆盖安装，首次打开应不再出现 crash 弹窗；然后确认资源检查/模型准备界面、第二次打开、已有模型缓存复用均正常。
+- 发布判断: 不阻塞生成 0.1.0 release package；notarized 包交付后保留最终安装验证。
+
+## QA-2026-07-10-007: 中文视频转写开头混入英文短句
+
+- 严重级别: Critical
+- 优先级: P0
+- 状态: Verified for 0.1.0 RC
+- 影响范围: balanced profile、中文视频/配乐/歌词类素材、`xianxia_story_cards.mp4`
+- 环境: macOS，Aural 0.1.0 notarized app，Qwen3-ASR 1.7B 4bit balanced profile
+- 复现步骤:
+  1. 导入 `xianxia_story_cards.mp4`。
+  2. 使用均衡型模型完成转写。
+  3. 查看转写开头和后续歌词段落。
+- 实际结果: 部分 run 在开头生成 `I've been watching you.` 或 `The.`，后续中文也有配乐/歌词场景下的措辞漂移。
+- 预期结果: 中文素材不应出现明显无关英文短句；同时不能为了单一中文 case 直接牺牲 `language=auto` 的基础能力。
+- 根因判断: 不是 UI、ITN、alignment 或 transcript 渲染问题；英文短句已经存在于 raw transcript。对同一 `source.m4a` 的矩阵验证显示，`language=auto` 下 `repetition_penalty=1.0/1.05/1.10` 都可能出现英文开头；强制 `language=zh` 可以消除英文开头，但该方案会改变产品默认语言行为，已被明确否决。进一步窗口矩阵显示：同一 0-60s/0-90s 输入在内部 `chunk_duration=30` 时稳定出现 `I've been watching you.`，不传内部 `chunk_duration` 时不出现；裁掉前 8.42s 后也不出现。因此当前主因更像是内部 30s 二次切分叠加开头音乐/弱人声触发语言漂移。
+- 当前修复: 保持 `WorkerRequest.language=auto`；默认首轮不传内部 `chunk_duration`，首轮使用 neutral `repetition_penalty=1.0`；仅在 hard repetition signal 命中时用 `1.10/context=32` 重试，retry 也不默认改变内部 `chunk_duration`。
+- 自动验证证据: `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-direct-segments.py` 和 `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-segmented-worker.py` 已覆盖动态 retry 逻辑和“不传内部 chunk_duration”策略。窗口矩阵证明 `chunk_duration=30` 是该样例英文前缀的重要触发条件；当前源码 worker 对同一 `source.m4a` 输出 `/tmp/aural-no-internal-chunk-xianxia/transcript.json`，metadata 为 `chunk_duration_sec=null`、`retry_chunk_duration_sec=null`，首段不再出现 `I've been watching you.`。
+- 手工验证: 用户在 `Aural-0.1.0-local-verify-20260710-123709.dmg` 上反馈“基本功能没有问题”。
+- 回归建议: 0.1.x 持续收集中文配乐/弱人声开头样例，避免未来重新引入内部短 `chunk_duration` 默认值。
+- 发布判断: 已接受为 0.1.0 release candidate。

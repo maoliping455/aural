@@ -191,6 +191,12 @@ struct ImportFeedback: Equatable, Sendable {
     }
 }
 
+private enum LocalResourceProbeResult: Sendable {
+    case status(ModelResourceStatus)
+    case ready
+    case needsDownload(ModelResourceConfiguration)
+}
+
 @MainActor
 final class AuralAppModel: ObservableObject {
     @Published var tasks: [TranscriptionTask] = []
@@ -217,6 +223,7 @@ final class AuralAppModel: ObservableObject {
     private var isImportingFiles = false
     private var modelDownloadBaselineBytes: UInt64?
     private var modelDownloadBaselineDate: Date?
+    private var resourceRefreshTask: Task<Void, Never>?
 
     init() {
         let dataRoot = RuntimePaths.defaultDataRoot()
@@ -408,7 +415,7 @@ final class AuralAppModel: ObservableObject {
         }
     }
 
-    func refreshLocalResourceState() {
+    func refreshLocalResourceState(prepareIfNeeded: Bool = false) {
         guard !isPreparingResources else {
             return
         }
@@ -417,33 +424,80 @@ final class AuralAppModel: ObservableObject {
         selectedModelProfile = configuration.profile
         selectedAlignmentEnabled = configuration.alignmentEnabled
 
+        resourceStatus = .checking
+        resourceRefreshTask?.cancel()
+
+        let profile = selectedModelProfile
+        let alignmentEnabled = selectedAlignmentEnabled
+        let model = self
+        resourceRefreshTask = Task { [model, profile, alignmentEnabled, prepareIfNeeded] in
+            let result = await Task.detached(priority: .utility) {
+                Self.probeLocalResourceState(
+                    profile: profile,
+                    alignmentEnabled: alignmentEnabled
+                )
+            }.value
+            guard !Task.isCancelled else {
+                return
+            }
+            model.resourceRefreshTask = nil
+            model.applyLocalResourceProbeResult(result, prepareIfNeeded: prepareIfNeeded)
+        }
+    }
+
+    nonisolated private static func probeLocalResourceState(
+        profile: ModelResourceProfile,
+        alignmentEnabled: Bool
+    ) -> LocalResourceProbeResult {
         if let compatibilityStatus = RuntimeCompatibility.blockingStatus() {
-            resourceStatus = compatibilityStatus
-            return
+            return .status(compatibilityStatus)
         }
 
+        let effectiveProfile = RuntimeCompatibility.effectiveProfile(profile)
+        let configuration = ModelResourceConfiguration(
+            profile: effectiveProfile,
+            alignmentEnabled: alignmentEnabled
+        )
         let preparer = ModelResourcePreparer(
-            profile: selectedModelProfile,
-            alignmentEnabled: selectedAlignmentEnabled
+            profile: effectiveProfile,
+            alignmentEnabled: alignmentEnabled
         )
         if let runtimeStatus = preparer.runtimeProbeStatus() {
-            resourceStatus = runtimeStatus
-            return
+            return .status(runtimeStatus)
         }
 
         if preparer.resourcesAreReady() {
-            resourceStatus = .ready
-            runQueue()
+            return .ready
+        }
+
+        return .needsDownload(configuration)
+    }
+
+    private func applyLocalResourceProbeResult(
+        _ result: LocalResourceProbeResult,
+        prepareIfNeeded: Bool
+    ) {
+        guard !isPreparingResources else {
             return
         }
 
-        resourceStatus = .needsDownload(
-            configuration: ModelResourceConfiguration(
-                profile: selectedModelProfile,
-                alignmentEnabled: selectedAlignmentEnabled
-            ),
-            allowsProfileSelection: true
-        )
+        switch result {
+        case .status(let status):
+            resourceStatus = status
+        case .ready:
+            resourceStatus = .ready
+            runQueue()
+        case .needsDownload(let configuration):
+            selectedModelProfile = configuration.profile
+            selectedAlignmentEnabled = configuration.alignmentEnabled
+            resourceStatus = .needsDownload(
+                configuration: configuration,
+                allowsProfileSelection: true
+            )
+            if prepareIfNeeded {
+                prepareLocalResources()
+            }
+        }
     }
 
     func prepareLocalResources() {
@@ -473,21 +527,11 @@ final class AuralAppModel: ObservableObject {
             return
         }
 
+        resourceRefreshTask?.cancel()
         let preparer = ModelResourcePreparer(
             profile: profile,
             alignmentEnabled: selectedAlignmentEnabled
         )
-        if let runtimeStatus = preparer.runtimeProbeStatus() {
-            resourceStatus = runtimeStatus
-            return
-        }
-
-        if preparer.resourcesAreReady() {
-            resourceStatus = .ready
-            runQueue()
-            return
-        }
-
         isPreparingResources = true
         modelDownloadBaselineBytes = nil
         modelDownloadBaselineDate = nil
@@ -587,10 +631,7 @@ final class AuralAppModel: ObservableObject {
             return
         }
 
-        refreshLocalResourceState()
-        if prepareIfNeeded, resourceStatus.phase == .needsDownload {
-            prepareLocalResources()
-        }
+        refreshLocalResourceState(prepareIfNeeded: prepareIfNeeded)
     }
 
     private func handleModelResourceEvent(_ event: ModelResourceEvent) {
@@ -2244,7 +2285,7 @@ private struct TaskPlaybackTranscriptSection: View {
                 )
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onChange(of: task.id) {
             playbackTime = 0
             isPlaybackActive = false

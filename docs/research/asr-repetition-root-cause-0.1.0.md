@@ -32,23 +32,29 @@ forced alignment 相关问题是第二类风险：部分长 chunk 在 ASR 文本
 
 ## 当前工程策略
 
-0.1.0 默认 worker 策略：
+0.1.0 当前 worker 策略：
 
 ```text
-ASR generate chunk_duration = 30s
+ASR generate chunk_duration = unset (Aural outer chunking only)
 ASR generate max_tokens = 8192
-4bit 默认 repetition_penalty = 1.10
-4bit 默认 repetition_context_size = 32
+4bit 首轮 repetition_penalty = 1.0
+异常重复时 retry chunk_duration = unset
+异常重复时 retry repetition_penalty = 1.10
+异常重复时 retry repetition_context_size = 32
 外层音频 chunk target/max/min = 60s / 90s / 10s
 ```
 
-`accurate` profile 对应 bf16 模型，默认不启用 repetition penalty，除非后续累计到 bf16 同类硬循环 case。
+worker 会在每个 chunk 的 raw ASR 输出上计算重复 n-gram 覆盖率。当输出命中 hard repetition signal 时，只重试该 chunk；未命中的正常 case 不再全局套用 `1.10`。这样保留 raw ASR blocker 的恢复路径，同时降低常规口语、歌词和弱人声素材被重复惩罚改写的风险。
+
+`accurate` profile 对应 bf16 模型，首轮默认不启用 repetition penalty；若出现同类 hard repetition，仍可通过相同 retry guard 恢复。
 
 可用于回滚或 A/B 的环境变量：
 
 ```bash
-AURAL_ASR_REPETITION_PENALTY=off
+AURAL_ASR_REPETITION_PENALTY=1.0
+AURAL_ASR_REPETITION_RETRY_PENALTY=1.10
 AURAL_ASR_REPETITION_CONTEXT_SIZE=32
+AURAL_ASR_REPETITION_RETRY=1
 AURAL_MODEL_PROFILE=balanced
 ```
 
@@ -64,16 +70,16 @@ AURAL_MODEL_PROFILE=balanced
 
 ## 当前验证结果
 
-2026-07-08 已对当前默认 4bit 策略补回归：
+2026-07-08 已对固定 `repetition_penalty=1.10` 的 4bit 策略补回归：
 
 - 18 个历史 `asr_repetition_with_alignment_reject` bad-case。
 - 结果：`bad=0`，`bad_rate=0.0%`。
 - 最大重复覆盖率：0.0849。
 - 平均单 chunk 生成耗时：约 4.6 秒。
-- 最新 direct worker 和 app queue + segmented worker 真实模型 smoke 均通过，transcript metadata 写入 `chunk_duration_sec=30.0`、`repetition_penalty=1.1`、`repetition_context_size=32`。
+- 当时 direct worker 和 app queue + segmented worker 真实模型 smoke 均通过，transcript metadata 写入 `chunk_duration_sec=30.0`、`repetition_penalty=1.1`、`repetition_context_size=32`。
 
-因此，当前已知 raw ASR repetition blocker 已按 v0.1.0 默认策略关闭。后续若新增 hard repetition case，应重新打开 P0 并补充到 bad-case 回归集。
+2026-07-10 根据新增常规 case 风险，策略调整为 dynamic repetition retry：首轮不传内部 `chunk_duration`，使用 neutral `1.0`；只在 hard repetition signal 命中时用 `1.10/context=32` 重试。当前 direct/segmented validation、direct worker smoke、app queue + alignment on/off smoke 均已通过；`xianxia_story_cards` targeted check 不再出现英文前缀。历史 hard repetition case 作为 0.1.x 持续回归集维护。
 
 ## 后续工作
 
-0.1.0 可以先采用 conservative repetition penalty 作为默认解码修复，但仍建议在 0.1.x 增加 chunk-level loop guard：当输出长度异常、重复覆盖率异常或疑似打满 token 时，自动用替代窗口或参数重跑该 chunk，而不是只做后处理。
+0.1.0 当前采用 chunk-level loop guard：当重复覆盖率异常时自动用更强 repetition penalty 重跑该 chunk，而不是把 `1.10` 作为所有 case 的全局默认。后续仍建议补充更细的异常信号，例如输出长度异常、疑似打满 token、语言漂移和低置信弱人声场景。

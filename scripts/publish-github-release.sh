@@ -15,6 +15,7 @@ if [[ -z "$TAG" ]]; then
   echo "AURAL_RELEASE_TAG is required, for example: AURAL_RELEASE_TAG=v0.1.0" >&2
   exit 1
 fi
+VERSION="${AURAL_RELEASE_VERSION:-${TAG#v}}"
 
 tag_commit="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
 head_commit="$(git rev-parse HEAD)"
@@ -43,19 +44,24 @@ shopt -s nullglob
 if [[ -n "${AURAL_DMG_PATH:-}" ]]; then
   dmg_path="$AURAL_DMG_PATH"
 else
-  dmg_candidates=("$RELEASE_DIR"/Aural-0.1.0-*.dmg)
-  if [[ "${#dmg_candidates[@]}" -eq 0 ]]; then
-    echo "No release DMG found in $RELEASE_DIR" >&2
-    echo "Run scripts/package-local-dmg.sh first." >&2
-    exit 1
-  fi
-
-  dmg_path="${dmg_candidates[0]}"
-  for candidate in "${dmg_candidates[@]}"; do
-    if [[ "$candidate" -nt "$dmg_path" ]]; then
-      dmg_path="$candidate"
+  stable_candidate="$RELEASE_DIR/Aural-$VERSION.dmg"
+  if [[ -f "$stable_candidate" ]]; then
+    dmg_path="$stable_candidate"
+  else
+    dmg_candidates=("$RELEASE_DIR"/Aural-"$VERSION"-*.dmg)
+    if [[ "${#dmg_candidates[@]}" -eq 0 ]]; then
+      echo "No release DMG found in $RELEASE_DIR" >&2
+      echo "Run scripts/package-local-dmg.sh first." >&2
+      exit 1
     fi
-  done
+
+    dmg_path="${dmg_candidates[0]}"
+    for candidate in "${dmg_candidates[@]}"; do
+      if [[ "$candidate" -nt "$dmg_path" ]]; then
+        dmg_path="$candidate"
+      fi
+    done
+  fi
 fi
 
 if [[ ! -f "$dmg_path" ]]; then
@@ -67,7 +73,7 @@ echo "Using release DMG: $dmg_path"
 
 hdiutil verify "$dmg_path"
 xcrun stapler validate "$dmg_path"
-spctl --assess --type open --verbose=4 "$dmg_path"
+spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
 
 checksum_file="$RELEASE_DIR/SHA256SUMS.txt"
 dmg_basename="$(basename "$dmg_path")"

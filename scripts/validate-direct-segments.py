@@ -44,12 +44,64 @@ class DummyGenerateModel:
 
 dummy_model = DummyGenerateModel()
 module.generate_one(dummy_model, Path("sample.wav"), "zh")
-if dummy_model.kwargs["chunk_duration"] != 30.0:
-    raise SystemExit(f"direct ASR should request 30s generation chunks: {dummy_model.kwargs}")
-if dummy_model.kwargs["repetition_penalty"] != 1.10:
-    raise SystemExit(f"direct ASR should request conservative repetition penalty: {dummy_model.kwargs}")
+if dummy_model.kwargs["chunk_duration"] is not None:
+    raise SystemExit(f"direct ASR first pass should not request internal chunks: {dummy_model.kwargs}")
+if dummy_model.kwargs["repetition_penalty"] != 1.0:
+    raise SystemExit(f"direct ASR should request neutral first-pass repetition penalty: {dummy_model.kwargs}")
 if dummy_model.kwargs["repetition_context_size"] != 32:
     raise SystemExit(f"direct ASR should request repetition context size: {dummy_model.kwargs}")
+
+
+class RepeatingGenerateModel:
+    def __init__(self):
+        self.kwargs = []
+        self.outputs = [
+            "嗯" * 40,
+            "今天主要讨论的是本地音频转写质量。动态重试只在异常重复时启用。",
+        ]
+
+    def generate(
+        self,
+        audio,
+        max_tokens,
+        verbose,
+        chunk_duration=None,
+        repetition_penalty=None,
+        repetition_context_size=None,
+        language=None,
+    ):
+        self.kwargs.append(
+            {
+                "audio": audio,
+                "max_tokens": max_tokens,
+                "verbose": verbose,
+                "chunk_duration": chunk_duration,
+                "repetition_penalty": repetition_penalty,
+                "repetition_context_size": repetition_context_size,
+                "language": language,
+            }
+        )
+        return self.outputs.pop(0)
+
+
+repeating_model = RepeatingGenerateModel()
+retry_text, retry_event = module.generate_text_with_repetition_retry(
+    repeating_model,
+    Path("sample.wav"),
+    "zh",
+)
+if len(repeating_model.kwargs) != 2:
+    raise SystemExit(f"direct ASR should retry abnormal repetition once: {repeating_model.kwargs}")
+if repeating_model.kwargs[0]["repetition_penalty"] != 1.0:
+    raise SystemExit(f"first pass should use neutral penalty: {repeating_model.kwargs}")
+if repeating_model.kwargs[0]["chunk_duration"] is not None:
+    raise SystemExit(f"first pass should not request internal chunks: {repeating_model.kwargs}")
+if repeating_model.kwargs[1]["repetition_penalty"] != 1.10:
+    raise SystemExit(f"retry pass should use stronger repetition penalty: {repeating_model.kwargs}")
+if repeating_model.kwargs[1]["chunk_duration"] is not None:
+    raise SystemExit(f"retry pass should only change repetition parameters: {repeating_model.kwargs}")
+if not retry_event or not retry_event["accepted_retry"] or retry_text.startswith("嗯"):
+    raise SystemExit(f"direct ASR should accept non-repeating retry text: {retry_event}, {retry_text}")
 
 text = (
     "今天主要讨论的是本地转写工具的核心范围。"

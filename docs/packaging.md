@@ -133,6 +133,8 @@ scripts/package-local-dmg.sh
 
 The DMG script names packages with the app version and timestamp, then prunes old local Aural packages in `.build/release`. By default it keeps only the latest 3 files matching `Aural-*.dmg`, `Aural-*.pkg`, or `Aural-*.zip`; set `AURAL_PACKAGE_KEEP_COUNT=<n>` only when a larger local package history is needed.
 
+Use timestamped DMG names for local release candidates and QA builds. For the public GitHub Release asset, prefer a stable versioned name such as `Aural-0.1.0.dmg`; create it with `AURAL_DMG_OUTPUT=.build/release/Aural-0.1.0.dmg scripts/package-local-dmg.sh`.
+
 If a future full offline package exceeds GitHub's single-asset limit, `scripts/package-release-split.sh` can split it as a fallback. Do not use split assets for the default lightweight 0.1.0 release.
 
 ## Sign And Notarize The Public DMG
@@ -162,7 +164,7 @@ After creating the DMG, submit and staple it:
 
 ```bash
 AURAL_NOTARYTOOL_PROFILE=AuralNotaryProfile \
-scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0-<timestamp>.dmg
+scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0.dmg
 ```
 
 ## Runtime Behavior
@@ -201,8 +203,9 @@ scripts/build-local-app.sh --include-runtime \
 AURAL_RUNTIME_MIN_MACOS=14.0 scripts/audit-runtime-compatibility.sh .build/release/Aural.app
 codesign --verify --deep --strict --verbose=2 .build/release/Aural.app
 spctl --assess --type execute --verbose=4 .build/release/Aural.app
+AURAL_DMG_OUTPUT=.build/release/Aural-0.1.0.dmg \
 scripts/package-local-dmg.sh
-scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0-<timestamp>.dmg
+scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0.dmg
 ```
 
 Run `env PYTHONDONTWRITEBYTECODE=1 scripts/validate-itn-postprocess.py` when the release bundle includes custom WeText ITN FST rules. If rules are not bundled, the worker keeps raw ASR text and records ITN fallback metadata.

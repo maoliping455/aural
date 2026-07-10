@@ -132,7 +132,7 @@ work/chunk-hallucination/scripts/run_bad_case_parameter_matrix.py \
 
 证据摘要：
 
-- 当前默认 4bit 策略：`chunk_duration=30s`、`max_tokens=8192`、`repetition_penalty=1.10`、`repetition_context_size=32`。
+- 当时验证的 4bit 策略：`chunk_duration=30s`、`max_tokens=8192`、固定 `repetition_penalty=1.10`、`repetition_context_size=32`。
 - 18 个历史 `asr_repetition_with_alignment_reject` bad-case。
 - `bad=0`，`bad_rate=0.0%`。
 - 最大重复覆盖率：0.0849。
@@ -142,12 +142,12 @@ work/chunk-hallucination/scripts/run_bad_case_parameter_matrix.py \
 
 - 已将最新 direct/segmented worker 同步到 `.build/release/Aural.app` 并重新 ad-hoc codesign 后复跑 `scripts/smoke-direct-bundle-worker.sh` 和 `scripts/smoke-app-queue-bundle.sh`。
 - 两个 smoke 均通过。
-- 最新 smoke transcript metadata 写入 `chunk_duration_sec=30.0`、`max_tokens=8192`、`repetition_penalty=1.1`、`repetition_context_size=32`。
+- 当时 smoke transcript metadata 写入 `chunk_duration_sec=30.0`、`max_tokens=8192`、`repetition_penalty=1.1`、`repetition_context_size=32`。
 
 结论：
 
-- 已知 raw ASR 大段重复 blocker 已按当前 v0.1.0 默认策略关闭。
-- 后续新增 hard repetition case 仍按 P0 重新打开。
+- 该记录证明固定 `1.10` 策略可以关闭当时已知 hard repetition bad-case。
+- 2026-07-10 当前策略已调整为 dynamic repetition retry，需重新补跑后再作为 v0.1.0 发布证据。
 
 | 项目 | 状态 | 原因 | 建议 |
 | --- | --- | --- | --- |

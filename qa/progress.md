@@ -20,7 +20,7 @@
 - `scripts/validate-itn-postprocess.py` 当前仍需要完整 ITN FST 资源；缺失时应作为待开发处理的资源/打包问题跟进。
 - `aural-validate` 已避免在源码目录生成 Python `__pycache__`，不会再阻断后续开源审计。
 - 真实模型 smoke 已完成第一轮：direct worker、app queue + segmented worker、alignment 开启、alignment 关闭、坏音频失败路径和 codesign 均通过；结果见 `qa/real-model-smoke-results-20260708.md`。
-- raw ASR 大段重复 P0 blocker 已完成根因说明和默认策略回归：当前默认 4bit 策略为 `chunk_duration=30s`、`repetition_penalty=1.10`、`repetition_context_size=32`；18 个历史 `asr_repetition_with_alignment_reject` bad-case 回归 `bad=0`，最新 direct/app queue 真实模型 smoke 通过且 metadata 记录新参数。
+- raw ASR 大段重复 P0 blocker 已完成根因说明；2026-07-10 当前策略调整为首轮不传内部 `chunk_duration`、`repetition_penalty=1.0`，异常重复时 `1.10/context=32` retry。当前 direct/segmented validation、direct worker smoke、app queue + alignment on/off smoke 和 `xianxia_story_cards` targeted check 已通过；历史 hard repetition case 作为 0.1.x 持续回归集维护。
 - 真实模型 smoke 仍未覆盖视频抽音频、英文短音频、aligner 缺失/损坏 fallback。
 
 ### 本轮测试结果

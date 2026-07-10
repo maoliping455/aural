@@ -102,8 +102,9 @@ scripts/build-local-app.sh --include-runtime \
 AURAL_RUNTIME_MIN_MACOS=14.0 scripts/audit-runtime-compatibility.sh .build/release/Aural.app
 codesign --verify --deep --strict --verbose=2 .build/release/Aural.app
 spctl --assess --type execute --verbose=4 .build/release/Aural.app
+AURAL_DMG_OUTPUT=.build/release/Aural-0.1.0.dmg \
 scripts/package-local-dmg.sh
-scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0-<timestamp>.dmg
+scripts/notarize-release-dmg.sh .build/release/Aural-0.1.0.dmg
 ```
 
 If the release bundle includes custom WeText ITN FST rules, also run:
@@ -118,7 +119,7 @@ Before cutting the final release candidate, also close the raw ASR repetition bl
 
 Attach to the GitHub Release:
 
-- `Aural-0.1.0-<timestamp>.dmg`
+- `Aural-0.1.0.dmg`
 - `SHA256SUMS.txt` if generated for the release
 - `THIRD_PARTY_NOTICES.md`
 - `RELEASE_NOTES.md`
